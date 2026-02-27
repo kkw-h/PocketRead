@@ -1,0 +1,23 @@
+name = "pocketread-server"
+main = "src/index.ts"
+compatibility_date = "2024-02-27"
+node_compat = true
+
+# D1 Database binding
+# Configure with: npx wrangler d1 create pocketread-db
+# Copy the database_id from the output
+[[d1_databases]]
+binding = "DB"
+database_name = "pocketread-db"
+database_id = "" # Replace with your D1 Database ID
+
+# R2 Bucket binding
+# Configure with: npx wrangler r2 bucket create pocketread-books
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "pocketread-books"
+
+# KV Namespace binding (optional for caching)
+# [[kv_namespaces]]
+# binding = "CACHE"
+# id = ""

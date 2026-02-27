@@ -24,3 +24,10 @@ CREATE TABLE books (
 
 CREATE INDEX idx_progress_updated ON reading_progress(updated_at);
 CREATE INDEX idx_books_updated ON books(updated_at);
+
+
+
+
+
+
+

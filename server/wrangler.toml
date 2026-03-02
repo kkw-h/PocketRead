@@ -9,7 +9,7 @@ node_compat = true
 [[d1_databases]]
 binding = "DB"
 database_name = "pocketread-db"
-database_id = "" # Replace with your D1 Database ID
+database_id = "02b41725-055b-49a5-a5b3-c8421491f36c"
 
 # R2 Bucket binding
 # Configure with: npx wrangler r2 bucket create pocketread-books

@@ -109,16 +109,93 @@ export default {
     }
     
     // Books endpoint
-    if (path === '/api/books') {
-      if (request.method === 'GET') {
-         // Return list of books from D1
-         const { results } = await env.DB.prepare('SELECT * FROM books ORDER BY updated_at DESC').all();
-         return new Response(JSON.stringify({ books: results }), {
-            headers: { 'content-type': 'application/json', ...corsHeaders },
-         });
+    if (path.startsWith('/api/books')) {
+      // List books
+      if (path === '/api/books') {
+        if (request.method === 'GET') {
+           // Return list of books from D1
+           const { results } = await env.DB.prepare('SELECT * FROM books ORDER BY updated_at DESC').all();
+           return new Response(JSON.stringify({ books: results }), {
+              headers: { 'content-type': 'application/json', ...corsHeaders },
+           });
+        }
+        
+        if (request.method === 'POST') {
+          try {
+            const formData = await request.formData();
+            const file = formData.get('file') as File;
+            const title = formData.get('title') as string;
+            const author = formData.get('author') as string;
+            const format = formData.get('format') as string || 'epub'; // Default to epub
+            
+            if (!file || !title) {
+              return new Response('Missing file or title', { status: 400, headers: corsHeaders });
+            }
+
+            const bookId = crypto.randomUUID();
+            const fileKey = `${bookId}.${format}`;
+            
+            // Upload to R2
+            await env.BUCKET.put(fileKey, file);
+            
+            // Save metadata to D1
+            const now = Date.now();
+            await env.DB.prepare(
+              'INSERT INTO books (id, title, author, file_key, file_size, format, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+            ).bind(bookId, title, author, fileKey, file.size, format, now, now).run();
+
+            return new Response(JSON.stringify({ 
+              status: 'success', 
+              book: {
+                id: bookId,
+                title,
+                author,
+                file_key: fileKey,
+                format
+              }
+            }), {
+              headers: { 'content-type': 'application/json', ...corsHeaders },
+            });
+
+          } catch (e) {
+            return new Response(`Upload failed: ${e}`, { status: 500, headers: corsHeaders });
+          }
+        }
       }
-      // TODO: Implement POST for uploading books (metadata to D1, file to R2)
-      return new Response(JSON.stringify({ status: 'not_implemented', message: 'Books upload not ready' }), {
+
+      // Download endpoint
+      const downloadMatch = path.match(/^\/api\/books\/([^/]+)\/download$/);
+      if (downloadMatch && request.method === 'GET') {
+         const bookId = downloadMatch[1];
+         try {
+           // Get file key from D1
+           const book = await env.DB.prepare('SELECT file_key, format FROM books WHERE id = ?').bind(bookId).first<{ file_key: string, format: string }>();
+           
+           if (!book) {
+             return new Response('Book not found', { status: 404, headers: corsHeaders });
+           }
+ 
+           const object = await env.BUCKET.get(book.file_key);
+           if (!object) {
+             return new Response('File not found in storage', { status: 404, headers: corsHeaders });
+           }
+ 
+           const headers = new Headers(corsHeaders);
+           object.writeHttpMetadata(headers);
+           headers.set('etag', object.httpEtag);
+           // Set correct content type
+           headers.set('Content-Type', book.format === 'epub' ? 'application/epub+zip' : 'text/plain');
+           // Set CORS headers
+           headers.set('Access-Control-Allow-Origin', '*');
+ 
+           return new Response(object.body, { headers });
+         } catch (e) {
+           return new Response(`Download failed: ${e}`, { status: 500, headers: corsHeaders });
+         }
+      }
+
+      return new Response(JSON.stringify({ status: 'not_implemented', message: 'Method not allowed' }), {
+        status: 405,
         headers: { 'content-type': 'application/json', ...corsHeaders },
       });
     }

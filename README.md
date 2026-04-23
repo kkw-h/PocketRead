@@ -172,3 +172,4 @@ PocketRead v1 的目标是做成一个可长期使用的本地阅读器：
 - 详细规划见 [docs/项目规划.md](/Users/kkw/www/kkw/PocketRead/docs/项目规划.md)
 - 开发任务拆解见 [docs/开发任务拆解表.md](/Users/kkw/www/kkw/PocketRead/docs/开发任务拆解表.md)
 - 技术方案与数据模型见 [docs/技术方案与数据模型.md](/Users/kkw/www/kkw/PocketRead/docs/技术方案与数据模型.md)
+- UI 页面规划见 [docs/UI页面规划.md](/Users/kkw/www/kkw/PocketRead/docs/UI页面规划.md)

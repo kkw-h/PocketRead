@@ -1,45 +1,163 @@
-# PocketRead - Cross-Platform Novel Reader
+# PocketRead
 
-A high-performance, self-hosted cross-platform novel reader with seamless sync across devices. Built with Flutter and Cloudflare Workers.
+PocketRead 是一个以本地阅读为核心的书籍阅读器项目，第一版聚焦两件事：
 
-## Project Structure
+- 书籍阅读
+- 书籍管理
 
-This is a monorepo containing both the client application and the serverless backend.
+项目当前以 `v1 MVP` 为目标，优先保证“能导入、能阅读、能续读、能管理”，暂不在首版引入云同步、账号体系、在线书库等复杂能力。
 
-- `app/`: Flutter application (Mobile: iOS/Android, Web, Desktop).
-- `server/`: Cloudflare Workers backend (API, D1 Database, R2 Storage).
-- `docs/`: Project documentation and planning.
+## v1 目标
 
-## Key Requirements & Validation
+PocketRead v1 的目标是做成一个可长期使用的本地阅读器：
 
-Based on the project plan (`docs/跨平台小说阅读器项目规划书.md`) and user validation:
+- 支持本地导入 `TXT / EPUB`
+- 支持本地书架管理
+- 支持基础阅读能力
+- 支持自动保存阅读进度
+- 支持本地阅读设置持久化
+- 支持 EPUB 封面提取与 TXT 自动分章
+- 支持收藏/置顶、重复导入检测、阅读页快捷设置和字体切换
 
-- **Target Audience**: Technical/Geek Users (Self-Hosted). Users will deploy their own backend instance.
-- **Sync Strategy**: Last Write Wins (LWW) for MVP conflict resolution.
-- **Performance**: Qualitative metrics (smooth experience) for MVP phase.
-- **Data Privacy**: All data is stored in user's own Cloudflare D1/R2 instance.
+首版只做本地数据管理，不依赖服务端。
 
-## Prerequisites
+## 功能范围
 
-- **Flutter SDK**: Required for building the client app.
-- **Node.js & npm**: Required for server development.
-- **Wrangler CLI**: Required for deploying Cloudflare Workers.
+### 必做功能
 
-## Getting Started
+#### 书籍管理
 
-### Server (Cloudflare Workers)
+- 单本导入
+- 批量导入
+- 自动识别 `TXT / EPUB`
+- 导入重复检测
+- 书架列表展示
+- 搜索书名/作者
+- 删除书籍
+- 最近阅读排序
+- 收藏或置顶
+- 阅读进度展示
+- EPUB 封面提取
 
-```bash
-cd server
-npm install
-npm run deploy
-```
+#### 书籍阅读
 
-### Client (Flutter)
+- 打开书籍并继续上次阅读
+- 翻页或滚动阅读
+- 目录跳转
+- 章节切换
+- TXT 自动分章
+- 字号调整
+- 行高调整
+- 页边距调整
+- 背景色切换
+- 白天/夜间模式
+- 阅读页快捷设置菜单
+- 阅读字体切换
 
-```bash
-cd app
-flutter run
-```
+#### 本地数据管理
 
-For detailed documentation, please refer to the `docs/` directory.
+- 本地保存书籍元数据
+- 本地保存阅读进度
+- 本地保存阅读设置
+
+### 明确延后
+
+- 云同步
+- 多设备同步
+- 笔记/划线
+- 听书
+- PDF
+- 在线书库
+- 登录与账号体系
+
+## 项目规划
+
+建议按 6 周推进：
+
+### 阶段 1：项目初始化（1 周）
+
+交付物：
+
+- Flutter 项目初始化
+- 路由与基础页面骨架
+- 主题系统
+- 本地数据库接入
+- 核心数据模型定义
+
+### 阶段 2：书籍管理 MVP（1.5 周）
+
+交付物：
+
+- 本地导入能力
+- 书架列表
+- 删除、搜索、排序
+- 收藏/置顶
+- 重复导入检测
+- EPUB 封面提取
+- 书籍元数据持久化
+
+### 阶段 3：阅读器 MVP（2 周）
+
+交付物：
+
+- TXT / EPUB 阅读能力
+- 目录跳转
+- 阅读设置
+- 阅读字体切换
+- 阅读页快捷设置菜单
+- TXT 自动分章
+- 自动保存阅读进度
+
+### 阶段 4：体验打磨（1 周）
+
+交付物：
+
+- 夜间模式
+- 最近阅读优化
+- 空状态与异常状态优化
+- 交互细节与阅读设置易用性优化
+
+### 阶段 5：测试与发布准备（0.5 周）
+
+交付物：
+
+- 测试清单
+- Bug 修复
+- 首版发布包
+
+## 验收标准
+
+满足以下条件即可认为 v1 可发布：
+
+1. 可以导入 `TXT / EPUB`
+2. 可以在书架中管理本地书籍
+3. 可以稳定打开并阅读书籍
+4. 可以调整基础阅读样式
+5. 退出后可以恢复阅读进度
+6. 支持 EPUB 封面提取、TXT 自动分章和导入重复检测
+7. 支持收藏/置顶、阅读页快捷设置和字体切换
+8. 本地数据稳定，不出现明显丢失或错乱
+
+## 技术建议
+
+如果继续采用仓库原有方向，建议首版技术栈如下：
+
+- 客户端：Flutter
+- 状态管理：Riverpod 或 BLoC
+- 路由：go_router
+- 本地数据库：Isar
+- 文件选择：file_picker
+- 本地配置：shared_preferences 或统一写入 Isar
+
+建议目录结构：
+
+- `app/lib/core`
+- `app/lib/features/bookshelf`
+- `app/lib/features/reader`
+- `app/lib/features/settings`
+- `app/lib/data`
+- `app/lib/domain`
+
+## 文档
+
+- 详细规划见 [docs/项目规划.md](/Users/kkw/www/kkw/PocketRead/docs/项目规划.md)

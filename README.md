@@ -7,6 +7,11 @@ PocketRead 是一个以本地阅读为核心的书籍阅读器项目，第一版
 
 项目当前以 `v1 MVP` 为目标，优先保证“能导入、能阅读、能续读、能管理”，暂不在首版引入云同步、账号体系、在线书库等复杂能力。
 
+当前首发平台：
+
+- Android
+- iOS
+
 ## v1 目标
 
 PocketRead v1 的目标是做成一个可长期使用的本地阅读器：
@@ -140,14 +145,18 @@ PocketRead v1 的目标是做成一个可长期使用的本地阅读器：
 
 ## 技术建议
 
-如果继续采用仓库原有方向，建议首版技术栈如下：
+当前确定的首版技术栈如下：
 
 - 客户端：Flutter
-- 状态管理：Riverpod 或 BLoC
+- 状态管理：Riverpod
 - 路由：go_router
-- 本地数据库：Isar
+- 本地数据库：Drift（SQLite）
 - 文件选择：file_picker
-- 本地配置：shared_preferences 或统一写入 Isar
+- 权限处理：permission_handler
+- 本地路径：path_provider
+- TXT 编码检测：flutter_charset_detector + charset_converter
+- EPUB 解析：epubx
+- EPUB HTML 渲染：flutter_widget_from_html_core
 
 建议目录结构：
 
@@ -161,3 +170,5 @@ PocketRead v1 的目标是做成一个可长期使用的本地阅读器：
 ## 文档
 
 - 详细规划见 [docs/项目规划.md](/Users/kkw/www/kkw/PocketRead/docs/项目规划.md)
+- 开发任务拆解见 [docs/开发任务拆解表.md](/Users/kkw/www/kkw/PocketRead/docs/开发任务拆解表.md)
+- 技术方案与数据模型见 [docs/技术方案与数据模型.md](/Users/kkw/www/kkw/PocketRead/docs/技术方案与数据模型.md)

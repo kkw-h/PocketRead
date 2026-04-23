@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:pocketread/features/book_detail/presentation/book_detail_page.dart';
 import 'package:pocketread/features/bookshelf/presentation/bookshelf_page.dart';
+import 'package:pocketread/features/my/presentation/my_page.dart';
 import 'package:pocketread/features/reader/presentation/reader_page.dart';
 import 'package:pocketread/features/settings/presentation/settings_page.dart';
 
@@ -24,6 +25,13 @@ final Provider<GoRouter> goRouterProvider = Provider<GoRouter>((Ref ref) {
           final String bookId = state.pathParameters['bookId']!;
 
           return MaterialPage<void>(child: BookDetailPage(bookId: bookId));
+        },
+      ),
+      GoRoute(
+        path: AppRoute.my.path,
+        name: AppRoute.my.name,
+        pageBuilder: (BuildContext context, GoRouterState state) {
+          return const MaterialPage<void>(child: MyPage());
         },
       ),
       GoRoute(
@@ -49,6 +57,7 @@ final Provider<GoRouter> goRouterProvider = Provider<GoRouter>((Ref ref) {
 enum AppRoute {
   bookshelf(name: 'bookshelf', path: '/'),
   bookDetail(name: 'book-detail', path: '/book/:bookId'),
+  my(name: 'my', path: '/my'),
   reader(name: 'reader', path: '/reader/:bookId'),
   settings(name: 'settings', path: '/settings');
 

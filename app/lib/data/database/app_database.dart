@@ -44,7 +44,8 @@ class Books extends Table {
 
   IntColumn get pinnedAt => integer().nullable()();
 
-  TextColumn get importStatus => text().withDefault(const Constant('pending'))();
+  TextColumn get importStatus =>
+      text().withDefault(const Constant('pending'))();
 
   IntColumn get parseVersion => integer().withDefault(const Constant(1))();
 
@@ -98,8 +99,8 @@ class BookChapters extends Table {
 
   @override
   List<Set<Column<Object>>> get uniqueKeys => <Set<Column<Object>>>[
-        <Column<Object>>{bookId, chapterIndex},
-      ];
+    <Column<Object>>{bookId, chapterIndex},
+  ];
 }
 
 class ReadingProgress extends Table {
@@ -107,7 +108,8 @@ class ReadingProgress extends Table {
 
   TextColumn get bookId => text().references(Books, #id).unique()();
 
-  IntColumn get currentChapterIndex => integer().withDefault(const Constant(0))();
+  IntColumn get currentChapterIndex =>
+      integer().withDefault(const Constant(0))();
 
   IntColumn get chapterOffset => integer().nullable()();
 
@@ -115,7 +117,8 @@ class ReadingProgress extends Table {
 
   RealColumn get progressPercent => real().withDefault(const Constant(0))();
 
-  TextColumn get locatorType => text().withDefault(const Constant('txt_offset'))();
+  TextColumn get locatorType =>
+      text().withDefault(const Constant('txt_offset'))();
 
   TextColumn get locatorValue => text().nullable()();
 
@@ -123,7 +126,8 @@ class ReadingProgress extends Table {
 
   IntColumn get lastReadAt => integer()();
 
-  IntColumn get totalReadingMinutes => integer().withDefault(const Constant(0))();
+  IntColumn get totalReadingMinutes =>
+      integer().withDefault(const Constant(0))();
 
   IntColumn get updatedAt => integer()();
 
@@ -136,7 +140,8 @@ class ReaderPreferences extends Table {
 
   TextColumn get themeMode => text().withDefault(const Constant('system'))();
 
-  TextColumn get backgroundColor => text().withDefault(const Constant('#F6F1E9'))();
+  TextColumn get backgroundColor =>
+      text().withDefault(const Constant('#F6F1E9'))();
 
   TextColumn get fontFamily => text().withDefault(const Constant('system'))();
 
@@ -222,28 +227,74 @@ class AppDatabase extends _$AppDatabase {
   AppDatabase(super.e);
 
   AppDatabase.defaults()
-      : super(
-          driftDatabase(
-            name: 'pocketread_db',
-            native: const DriftNativeOptions(
-              shareAcrossIsolates: true,
-            ),
-          ),
-        );
+    : super(
+        driftDatabase(
+          name: 'pocketread_db',
+          native: const DriftNativeOptions(shareAcrossIsolates: true),
+        ),
+      );
 
   @override
   int get schemaVersion => 1;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
-        onCreate: (Migrator migrator) async {
-          await migrator.createAll();
-          await into(readerPreferences).insert(
-            ReaderPreferencesCompanion(
-              id: const Value<int>(1),
-              updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
-            ),
-          );
-        },
+    onCreate: (Migrator migrator) async {
+      await migrator.createAll();
+      await _createV1Indexes();
+      await into(readerPreferences).insert(
+        ReaderPreferencesCompanion(
+          id: const Value<int>(1),
+          updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+        ),
       );
+    },
+    beforeOpen: (OpeningDetails details) async {
+      await customStatement('PRAGMA foreign_keys = ON');
+      await _createV1Indexes();
+    },
+  );
+
+  Future<void> _createV1Indexes() async {
+    await customStatement(
+      'CREATE INDEX IF NOT EXISTS idx_books_file_hash '
+      'ON books(file_hash)',
+    );
+    await customStatement(
+      'CREATE INDEX IF NOT EXISTS idx_books_last_read_at '
+      'ON books(last_read_at)',
+    );
+    await customStatement(
+      'CREATE INDEX IF NOT EXISTS idx_books_pinned_at '
+      'ON books(pinned_at)',
+    );
+    await customStatement(
+      'CREATE INDEX IF NOT EXISTS idx_books_title '
+      'ON books(title)',
+    );
+    await customStatement(
+      'CREATE INDEX IF NOT EXISTS idx_book_chapters_book_id_index '
+      'ON book_chapters(book_id, chapter_index)',
+    );
+    await customStatement(
+      'CREATE INDEX IF NOT EXISTS idx_book_chapters_book_id_parent_id '
+      'ON book_chapters(book_id, parent_id)',
+    );
+    await customStatement(
+      'CREATE INDEX IF NOT EXISTS idx_import_records_file_hash '
+      'ON import_records(file_hash)',
+    );
+    await customStatement(
+      'CREATE INDEX IF NOT EXISTS idx_import_records_created_at '
+      'ON import_records(created_at)',
+    );
+    await customStatement(
+      'CREATE INDEX IF NOT EXISTS idx_import_records_created_book_id '
+      'ON import_records(created_book_id)',
+    );
+    await customStatement(
+      'CREATE INDEX IF NOT EXISTS idx_import_records_duplicate_book_id '
+      'ON import_records(duplicate_book_id)',
+    );
+  }
 }

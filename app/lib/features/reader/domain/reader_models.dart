@@ -5,6 +5,7 @@ class ReaderBookModel {
     required this.author,
     required this.format,
     required this.totalChapters,
+    required this.coverImagePath,
   });
 
   final String id;
@@ -12,6 +13,7 @@ class ReaderBookModel {
   final String author;
   final String format;
   final int totalChapters;
+  final String? coverImagePath;
 }
 
 class ReaderChapterModel {

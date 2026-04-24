@@ -1,12 +1,15 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:pocketread/core/router/app_router.dart';
 import 'package:pocketread/core/widgets/ux_state_view.dart';
 import 'package:pocketread/features/book_detail/application/book_detail_providers.dart';
 import 'package:pocketread/features/book_detail/domain/book_detail_model.dart';
+import 'package:pocketread/features/bookshelf/application/bookshelf_providers.dart';
+import 'package:pocketread/features/reader/application/reader_providers.dart';
 
 class BookDetailPage extends ConsumerWidget {
   const BookDetailPage({required this.bookId, super.key});
@@ -94,10 +97,15 @@ class BookDetailPage extends ConsumerWidget {
                   const SizedBox(height: 16),
                   _StatsCard(data: data),
                   const SizedBox(height: 16),
-                  _ContinueButton(data: data),
+                  _ContinueButton(
+                    data: data,
+                    onTap: () => _openReader(context, ref, data.id),
+                  ),
                   const SizedBox(height: 16),
                   _ActionRow(
                     data: data,
+                    onToggleFavorite: () => _toggleFavorite(ref, data),
+                    onTogglePinned: () => _togglePinned(ref, data),
                     onRead: () => _openReader(context, ref, data.id),
                     onDelete: () => _confirmDelete(context, ref, data),
                   ),
@@ -127,6 +135,25 @@ class BookDetailPage extends ConsumerWidget {
       isScrollControlled: true,
       builder: (BuildContext context) {
         return _DetailActionsSheet(
+          data: data,
+          onToggleFavorite: () async {
+            Navigator.of(context).pop();
+            await _toggleFavorite(ref, data);
+          },
+          onTogglePinned: () async {
+            Navigator.of(context).pop();
+            await _togglePinned(ref, data);
+          },
+          onCopyLocalPath: () async {
+            Navigator.of(context).pop();
+            await Clipboard.setData(ClipboardData(text: data.localFilePath));
+            if (!context.mounted) {
+              return;
+            }
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('已复制本地路径')),
+            );
+          },
           onRead: () {
             Navigator.of(context).pop();
             _openReader(context, ref, data.id);
@@ -145,7 +172,14 @@ class BookDetailPage extends ConsumerWidget {
     WidgetRef ref,
     String bookId,
   ) async {
+    final Size viewportSize = MediaQuery.sizeOf(context);
+    final TextScaler textScaler = MediaQuery.textScalerOf(context);
     await ref.read(deleteBookRepositoryProvider).markReadIntent(bookId);
+    await ref.read(readerLaunchWarmupServiceProvider).warmUpBook(
+      bookId: bookId,
+      viewportSize: viewportSize,
+      textScaler: textScaler,
+    );
     if (!context.mounted) {
       return;
     }
@@ -153,6 +187,22 @@ class BookDetailPage extends ConsumerWidget {
       AppRoute.reader.name,
       pathParameters: <String, String>{'bookId': bookId},
     );
+  }
+
+  Future<void> _toggleFavorite(WidgetRef ref, BookDetailModel data) async {
+    await ref
+        .read(deleteBookRepositoryProvider)
+        .setFavorite(data.id, isFavorite: !data.isFavorite);
+    ref.invalidate(bookDetailProvider(data.id));
+    ref.invalidate(bookshelfBooksProvider);
+  }
+
+  Future<void> _togglePinned(WidgetRef ref, BookDetailModel data) async {
+    await ref
+        .read(deleteBookRepositoryProvider)
+        .setPinned(data.id, isPinned: !data.isPinned);
+    ref.invalidate(bookDetailProvider(data.id));
+    ref.invalidate(bookshelfBooksProvider);
   }
 
   Future<void> _confirmDelete(
@@ -605,48 +655,56 @@ class _StatItem extends StatelessWidget {
 }
 
 class _ContinueButton extends StatelessWidget {
-  const _ContinueButton({required this.data});
+  const _ContinueButton({
+    required this.data,
+    required this.onTap,
+  });
 
   final BookDetailModel data;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      height: 74,
-      decoration: BoxDecoration(
-        color: BookDetailPage._buttonBackground,
+    return Material(
+      color: BookDetailPage._buttonBackground,
+      borderRadius: BorderRadius.circular(14),
+      child: InkWell(
+        onTap: onTap,
         borderRadius: BorderRadius.circular(14),
-      ),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: <Widget>[
-          const Row(
+        child: SizedBox(
+          height: 74,
+          child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: <Widget>[
-              Icon(Icons.menu_book_outlined, color: Colors.white, size: 22),
-              SizedBox(width: 8),
+              const Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: <Widget>[
+                  Icon(Icons.menu_book_outlined, color: Colors.white, size: 22),
+                  SizedBox(width: 8),
+                  Text(
+                    '继续阅读',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 17,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
               Text(
-                '继续阅读',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 17,
-                  fontWeight: FontWeight.w700,
+                data.lastReadChapterLabel == null
+                    ? '从第一页开始阅读'
+                    : '上次阅读至：${data.lastReadChapterLabel}',
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                  color: Color(0xFFBAADA4),
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 8),
-          Text(
-            data.lastReadChapterLabel == null
-                ? '从第一页开始阅读'
-                : '上次阅读至：${data.lastReadChapterLabel}',
-            style: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w500,
-              color: Color(0xFFBAADA4),
-            ),
-          ),
-        ],
+        ),
       ),
     );
   }
@@ -655,11 +713,15 @@ class _ContinueButton extends StatelessWidget {
 class _ActionRow extends StatelessWidget {
   const _ActionRow({
     required this.data,
+    required this.onToggleFavorite,
+    required this.onTogglePinned,
     required this.onRead,
     required this.onDelete,
   });
 
   final BookDetailModel data;
+  final VoidCallback onToggleFavorite;
+  final VoidCallback onTogglePinned;
   final VoidCallback onRead;
   final VoidCallback onDelete;
 
@@ -674,6 +736,7 @@ class _ActionRow extends StatelessWidget {
                 : Icons.star_outline_rounded,
             label: data.isFavorite ? '已收藏' : '未收藏',
             iconColor: BookDetailPage._accentOrange,
+            onTap: onToggleFavorite,
           ),
         ),
         const SizedBox(width: 12),
@@ -681,6 +744,7 @@ class _ActionRow extends StatelessWidget {
           child: _ActionTile(
             icon: Icons.vertical_align_top_rounded,
             label: data.isPinned ? '已置顶' : '未置顶',
+            onTap: onTogglePinned,
           ),
         ),
         const SizedBox(width: 12),
@@ -939,8 +1003,19 @@ class _InfoRow extends StatelessWidget {
 }
 
 class _DetailActionsSheet extends StatelessWidget {
-  const _DetailActionsSheet({required this.onRead, required this.onDelete});
+  const _DetailActionsSheet({
+    required this.data,
+    required this.onToggleFavorite,
+    required this.onTogglePinned,
+    required this.onCopyLocalPath,
+    required this.onRead,
+    required this.onDelete,
+  });
 
+  final BookDetailModel data;
+  final VoidCallback onToggleFavorite;
+  final VoidCallback onTogglePinned;
+  final VoidCallback onCopyLocalPath;
   final VoidCallback onRead;
   final VoidCallback onDelete;
 
@@ -960,16 +1035,30 @@ class _DetailActionsSheet extends StatelessWidget {
             const _SheetHandle(),
             const SizedBox(height: 12),
             _SheetActionTile(
+              icon: data.isFavorite
+                  ? Icons.star_rounded
+                  : Icons.star_outline_rounded,
+              title: data.isFavorite ? '取消收藏' : '加入收藏',
+              subtitle: '更新书架收藏状态',
+              onTap: onToggleFavorite,
+            ),
+            _SheetActionTile(
+              icon: Icons.vertical_align_top_rounded,
+              title: data.isPinned ? '取消置顶' : '置顶书籍',
+              subtitle: '调整书架展示顺序',
+              onTap: onTogglePinned,
+            ),
+            _SheetActionTile(
               icon: Icons.menu_book_outlined,
               title: '继续阅读',
               subtitle: '打开阅读器',
               onTap: onRead,
             ),
             _SheetActionTile(
-              icon: Icons.folder_open_outlined,
-              title: '本地文件',
-              subtitle: '文件已复制到应用书库',
-              onTap: () => Navigator.of(context).pop(),
+              icon: Icons.content_copy_rounded,
+              title: '复制本地路径',
+              subtitle: '复制应用内书籍文件路径',
+              onTap: onCopyLocalPath,
             ),
             const Divider(height: 20, color: BookDetailPage._line),
             _SheetActionTile(

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -11,6 +12,7 @@ import 'package:pocketread/features/bookshelf/domain/bookshelf_book.dart';
 import 'package:pocketread/features/importer/application/importer_providers.dart';
 import 'package:pocketread/features/importer/domain/import_job.dart';
 import 'package:pocketread/features/importer/domain/import_selection.dart';
+import 'package:pocketread/features/reader/application/reader_providers.dart';
 
 class BookshelfPage extends ConsumerStatefulWidget {
   const BookshelfPage({super.key});
@@ -31,6 +33,7 @@ class _BookshelfPageState extends ConsumerState<BookshelfPage> {
   _SortType _sortType = _SortType.recentRead;
   String _searchQuery = '';
   _ShelfNotice? _notice;
+  String? _preheatedRecentBookId;
 
   List<BookshelfBook> _filteredBooks(List<BookshelfBook> books) {
     final String keyword = _searchQuery.trim().toLowerCase();
@@ -103,6 +106,7 @@ class _BookshelfPageState extends ConsumerState<BookshelfPage> {
       orElse: () => const <BookshelfBook>[],
     );
     final List<BookshelfBook> books = _filteredBooks(allBooks);
+    _scheduleRecentReadWarmup(context, allBooks);
 
     return Scaffold(
       backgroundColor: _bg,
@@ -456,7 +460,8 @@ class _BookshelfPageState extends ConsumerState<BookshelfPage> {
     if (report.failedCount > 0) {
       return _ShelfNotice(
         title: '导入已完成',
-        message: '成功 ${report.importedCount} 本，重复 ${report.duplicateCount} 本，失败 ${report.failedCount} 本。',
+        message:
+            '成功 ${report.importedCount} 本，重复 ${report.duplicateCount} 本，失败 ${report.failedCount} 本。',
         tone: report.importedCount > 0
             ? UxNoticeTone.warning
             : UxNoticeTone.danger,
@@ -465,7 +470,8 @@ class _BookshelfPageState extends ConsumerState<BookshelfPage> {
     if (report.duplicateCount > 0) {
       return _ShelfNotice(
         title: '检测到重复书籍',
-        message: '成功 ${report.importedCount} 本，本地重复 ${report.duplicateCount} 本。',
+        message:
+            '成功 ${report.importedCount} 本，本地重复 ${report.duplicateCount} 本。',
         tone: UxNoticeTone.info,
       );
     }
@@ -575,6 +581,7 @@ class _BookshelfPageState extends ConsumerState<BookshelfPage> {
 
   Future<void> _continueReading(BookshelfBook book) async {
     await ref.read(bookshelfRepositoryProvider).markReadIntent(book.id);
+    await _prewarmReader(book.id);
     if (!mounted) {
       return;
     }
@@ -582,6 +589,40 @@ class _BookshelfPageState extends ConsumerState<BookshelfPage> {
       AppRoute.reader.name,
       pathParameters: <String, String>{'bookId': book.id},
     );
+  }
+
+  Future<void> _prewarmReader(String bookId) {
+    return ref.read(readerLaunchWarmupServiceProvider).warmUpBook(
+      bookId: bookId,
+      viewportSize: MediaQuery.sizeOf(context),
+      textScaler: MediaQuery.textScalerOf(context),
+    );
+  }
+
+  void _scheduleRecentReadWarmup(
+    BuildContext context,
+    List<BookshelfBook> books,
+  ) {
+    if (books.isEmpty) {
+      return;
+    }
+    final List<BookshelfBook> recentBooks = books.toList()
+      ..sort((BookshelfBook a, BookshelfBook b) {
+        return (b.lastReadAt ?? DateTime(1970)).compareTo(
+          a.lastReadAt ?? DateTime(1970),
+        );
+      });
+    final BookshelfBook candidate = recentBooks.first;
+    if (candidate.lastReadAt == null || _preheatedRecentBookId == candidate.id) {
+      return;
+    }
+    _preheatedRecentBookId = candidate.id;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      unawaited(_prewarmReader(candidate.id));
+    });
   }
 }
 
@@ -610,7 +651,7 @@ class _BookshelfContent extends StatelessWidget {
           crossAxisCount: 3,
           crossAxisSpacing: 16,
           mainAxisSpacing: 22,
-          childAspectRatio: 0.45,
+          childAspectRatio: 0.44,
         ),
         itemBuilder: (BuildContext context, int index) {
           return _BookCard(
@@ -812,9 +853,7 @@ class _ImportResultSheet extends StatelessWidget {
                     onPressed: onRetryFailed ?? onClose,
                     style: OutlinedButton.styleFrom(
                       minimumSize: const Size.fromHeight(48),
-                      side: const BorderSide(
-                        color: _BookshelfPageState._line,
-                      ),
+                      side: const BorderSide(color: _BookshelfPageState._line),
                       foregroundColor: _BookshelfPageState._black,
                       shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(14),

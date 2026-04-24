@@ -1,13 +1,20 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:flutter_widget_from_html_core/flutter_widget_from_html_core.dart';
 import 'package:pocketread/core/widgets/ux_state_view.dart';
+import 'package:pocketread/data/repositories/reader_repository.dart';
+import 'package:pocketread/features/reader/application/reader_launch_warmup_service.dart';
 import 'package:pocketread/features/reader/application/reader_providers.dart';
 import 'package:pocketread/features/reader/domain/reader_models.dart';
+
+const double _readerPageTopPadding = 44;
+const double _readerPageBottomPadding = 48;
+const double _readerHeaderGap = 12;
+const double _readerDisplayTitleGap = 20;
 
 class ReaderPage extends ConsumerStatefulWidget {
   const ReaderPage({required this.bookId, super.key});
@@ -27,9 +34,13 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
   static const Color _accent = Color(0xFF2E9D62);
   static const Color _overlaySurface = Color(0xFFFFFCF7);
   static const Color _overlayChipSurface = Color(0xFFF7F3EC);
+  static const int _maxChapterPaginationCacheEntries = 24;
+  static final Map<String, List<_ReaderPageEntry>> _chapterPaginationCache =
+      <String, List<_ReaderPageEntry>>{};
 
   final PageController _pageController = PageController();
 
+  late final ReaderRepository _readerRepository;
   ReaderBookDetail? _detail;
   List<_ReaderPageEntry> _pages = const <_ReaderPageEntry>[];
   _ReaderUiSettings _settings = _ReaderUiSettings.defaults();
@@ -37,6 +48,10 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
   bool _chromeVisible = false;
   bool _loading = true;
   String? _errorMessage;
+  String? _paginationSignature;
+  _ReaderPageEntry? _paginationAnchor;
+  _ReaderLayoutSnapshot? _layoutSnapshot;
+  final Set<String> _queuedPrepaginationKeys = <String>{};
   Timer? _saveDebounce;
   Timer? _settingsSaveDebounce;
   DateTime _openedAt = DateTime.now();
@@ -44,6 +59,7 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
   @override
   void initState() {
     super.initState();
+    _readerRepository = ref.read(readerRepositoryProvider);
     WidgetsBinding.instance.addObserver(this);
     _loadReader();
   }
@@ -53,9 +69,7 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     WidgetsBinding.instance.removeObserver(this);
     _saveDebounce?.cancel();
     _settingsSaveDebounce?.cancel();
-    unawaited(
-      ref.read(readerRepositoryProvider).saveReaderSettings(_settings.toModel()),
-    );
+    unawaited(_readerRepository.saveReaderSettings(_settings.toModel()));
     _saveProgress();
     _pageController.dispose();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
@@ -78,12 +92,11 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     });
 
     try {
-      final ReaderSettingsModel savedSettings = await ref
-          .read(readerRepositoryProvider)
+      final ReaderSettingsModel savedSettings = await _readerRepository
           .getReaderSettings();
-      final ReaderBookDetail? detail = await ref
-          .read(readerRepositoryProvider)
-          .getBookDetail(widget.bookId);
+      final ReaderBookDetail? detail = await _readerRepository.getBookDetail(
+        widget.bookId,
+      );
       if (!mounted) {
         return;
       }
@@ -106,23 +119,31 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
       final _ReaderUiSettings loadedSettings = _ReaderUiSettings.fromModel(
         savedSettings,
       );
-      final List<_ReaderPageEntry> pages = _buildBookPages(
-        detail,
-        loadedSettings,
+      final ReaderLaunchWarmupService warmupService = ref.read(
+        readerLaunchWarmupServiceProvider,
       );
-      final int initialPageIndex = _restorePageIndex(detail.progress, pages);
-
+      final ReaderWarmupResult? preparedLaunch = _layoutSnapshot == null
+          ? null
+          : warmupService.takePreparedLaunch(
+              bookId: widget.bookId,
+              signature: ReaderLaunchWarmupService.buildPaginationSignature(
+                viewportSize: _layoutSnapshot!.viewportSize,
+                textScaler: _layoutSnapshot!.textScaler,
+                bookId: detail.book.id,
+                chapterCount: detail.chapters.length,
+                totalReadableLength: _totalReadableLength(detail),
+                settings: savedSettings,
+              ),
+            );
       setState(() {
         _settings = loadedSettings;
         _detail = detail;
-        _pages = pages;
-        _globalPageIndex = initialPageIndex;
+        _pages = preparedLaunch == null
+            ? const <_ReaderPageEntry>[]
+            : _pageEntriesFromWarmup(detail, preparedLaunch);
+        _globalPageIndex = preparedLaunch?.initialPageIndex ?? 0;
+        _paginationSignature = preparedLaunch?.signature;
         _loading = false;
-      });
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_pageController.hasClients && pages.isNotEmpty) {
-          _pageController.jumpToPage(initialPageIndex);
-        }
       });
     } on Exception catch (_) {
       if (!mounted) {
@@ -135,128 +156,263 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     }
   }
 
-  List<_ReaderPageEntry> _buildBookPages(
-    ReaderBookDetail detail,
-    _ReaderUiSettings settings,
-  ) {
-    final List<_ReaderPageEntry> pages = <_ReaderPageEntry>[];
-    for (final ReaderChapterModel chapter in detail.chapters) {
-      final List<String> chapterPages = _buildChapterPages(chapter, settings);
-      for (int i = 0; i < chapterPages.length; i += 1) {
-        pages.add(
-          _ReaderPageEntry(
-            chapter: chapter,
-            pageInChapter: i,
-            pageCountInChapter: chapterPages.length,
-            content: chapterPages[i],
-            showsTitle: i == 0,
-            showHtml:
-                detail.book.format == 'epub' &&
-                chapter.htmlContent != null &&
-                chapterPages.length == 1,
-          ),
-        );
-      }
-    }
-    return pages;
-  }
-
-  List<String> _buildChapterPages(
+  List<_ReaderPageEntry> _buildChapterPages(
     ReaderChapterModel chapter,
     _ReaderUiSettings settings,
+    Size viewportSize,
+    TextScaler textScaler,
+    BuildContext context,
   ) {
     final String text = _readableText(chapter).trim();
     if (text.isEmpty) {
-      return const <String>['本章暂无正文内容'];
+      return <_ReaderPageEntry>[
+        _ReaderPageEntry(
+          chapter: chapter,
+          pageInChapter: 0,
+          pageCountInChapter: 1,
+          chapterTextStart: 0,
+          chapterTextEnd: 6,
+          globalReadableOffset: 0,
+          content: '本章暂无正文内容',
+          showsTitle: true,
+        ),
+      ];
     }
 
-    final List<String> paragraphs = text
-        .split(RegExp(r'\n{2,}'))
-        .map((String value) => value.trim())
-        .where((String value) => value.isNotEmpty)
-        .toList(growable: false);
-    if (paragraphs.isEmpty) {
-      return <String>[text];
+    final _ReaderPageLayout layout = _pageLayoutFor(
+      settings,
+      viewportSize,
+      context,
+    );
+    final TextStyle bodyStyle = _bodyTextStyle(settings, context);
+    final List<_ReaderTextSlice> slices = <_ReaderTextSlice>[];
+    int start = 0;
+    bool firstPage = true;
+
+    while (start < text.length) {
+      final double availableHeight = firstPage
+          ? layout.firstPageBodyHeight
+          : layout.followingPageBodyHeight;
+      final int end = _findPageEnd(
+        text: text,
+        start: start,
+        maxWidth: layout.contentWidth,
+        maxHeight: availableHeight,
+        style: bodyStyle,
+        textScaler: textScaler,
+      );
+      slices.add(_ReaderTextSlice(start: start, end: end));
+      start = _skipLeadingBreaks(text, end);
+      firstPage = false;
     }
 
-    final int firstPageLimit = settings.firstPageCharLimit;
-    final int followingPageLimit = settings.followingPageCharLimit;
-    final List<String> pages = <String>[];
-    final StringBuffer buffer = StringBuffer();
-
-    for (final String paragraph in paragraphs) {
-      final int limit = pages.isEmpty ? firstPageLimit : followingPageLimit;
-      final String candidate = buffer.isEmpty
-          ? paragraph
-          : '${buffer.toString()}\n\n$paragraph';
-      if (candidate.length <= limit) {
-        buffer
-          ..clear()
-          ..write(candidate);
-        continue;
-      }
-
-      if (buffer.isNotEmpty) {
-        pages.add(buffer.toString());
-        buffer.clear();
-      }
-
-      int start = 0;
-      while (start < paragraph.length) {
-        final int pageLimit = pages.isEmpty
-            ? firstPageLimit
-            : followingPageLimit;
-        final int end = math.min(start + pageLimit, paragraph.length);
-        pages.add(paragraph.substring(start, end));
-        start = end;
-      }
-    }
-
-    if (buffer.isNotEmpty) {
-      pages.add(buffer.toString());
-    }
-
-    return pages.isEmpty ? <String>[text] : pages;
+    final int pageCount = math.max(1, slices.length);
+    return List<_ReaderPageEntry>.generate(pageCount, (int index) {
+      final _ReaderTextSlice slice = slices[index];
+      return _ReaderPageEntry(
+        chapter: chapter,
+        pageInChapter: index,
+        pageCountInChapter: pageCount,
+        chapterTextStart: slice.start,
+        chapterTextEnd: slice.end,
+        globalReadableOffset: _readableOffsetBeforeChapter(
+          chapter.chapterIndex,
+        ),
+        content: text.substring(slice.start, slice.end),
+        showsTitle: index == 0,
+      );
+    }, growable: false);
   }
 
-  int _restorePageIndex(
-    ReaderProgressModel? progress,
-    List<_ReaderPageEntry> pages,
-  ) {
-    if (pages.isEmpty) {
-      return 0;
-    }
-    final String? locatorValue = progress?.locatorValue;
-    if (locatorValue != null) {
-      final RegExpMatch? match = RegExp(
-        r'^page:(\d+):(\d+)$',
-      ).firstMatch(locatorValue);
-      if (match != null) {
-        final int chapterIndex = int.tryParse(match.group(1) ?? '') ?? 0;
-        final int pageInChapter = int.tryParse(match.group(2) ?? '') ?? 0;
-        final int index = pages.indexWhere((_ReaderPageEntry entry) {
-          return entry.chapter.chapterIndex == chapterIndex &&
-              entry.pageInChapter == pageInChapter;
-        });
-        if (index >= 0) {
-          return index;
-        }
+  int _findPageEnd({
+    required String text,
+    required int start,
+    required double maxWidth,
+    required double maxHeight,
+    required TextStyle style,
+    required TextScaler textScaler,
+  }) {
+    int low = start + 1;
+    int high = text.length;
+    int best = low;
+    while (low <= high) {
+      final int middle = low + ((high - low) >> 1);
+      if (_fitsPage(
+        text.substring(start, middle),
+        maxWidth,
+        maxHeight,
+        style,
+        textScaler,
+      )) {
+        best = middle;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
       }
     }
 
-    final int chapterIndex = progress?.currentChapterIndex ?? 0;
-    final int fallback = pages.indexWhere(
+    if (best >= text.length) {
+      return text.length;
+    }
+
+    final int softBreak = _lastSoftBreak(text, start, best);
+    if (softBreak > start) {
+      return softBreak;
+    }
+    return best;
+  }
+
+  bool _fitsPage(
+    String value,
+    double maxWidth,
+    double maxHeight,
+    TextStyle style,
+    TextScaler textScaler,
+  ) {
+    final TextPainter painter = TextPainter(
+      text: TextSpan(text: _displayText(value), style: style),
+      textAlign: TextAlign.justify,
+      textDirection: TextDirection.ltr,
+      textScaler: textScaler,
+    )..layout(maxWidth: maxWidth);
+    return painter.height <= maxHeight;
+  }
+
+  String _displayText(String value) {
+    final List<String> lines = value
+        .split('\n')
+        .map((String item) => item.trimRight())
+        .where((String item) => item.isNotEmpty)
+        .toList(growable: false);
+    if (lines.isEmpty) {
+      return value;
+    }
+    return lines.join('\n');
+  }
+
+  int _lastSoftBreak(String text, int start, int best) {
+    final int lowerBound = math.max(start, best - 80);
+    for (int index = best; index > lowerBound; index -= 1) {
+      final String char = text[index - 1];
+      if (char == '\n' ||
+          char == '。' ||
+          char == '！' ||
+          char == '？' ||
+          char == '；' ||
+          char == '，' ||
+          char == '、' ||
+          char == ' ' ||
+          char == '.') {
+        return index;
+      }
+    }
+    return best;
+  }
+
+  int _skipLeadingBreaks(String text, int offset) {
+    int next = offset;
+    while (next < text.length && text.codeUnitAt(next) <= 32) {
+      next += 1;
+    }
+    return next;
+  }
+
+  int _restoreChapterIndex(ReaderProgressModel? progress) {
+    final String? locatorValue = progress?.locatorValue;
+    if (locatorValue != null) {
+      final RegExpMatch? offsetMatch = RegExp(
+        r'^offset:(\d+):(\d+)$',
+      ).firstMatch(locatorValue);
+      if (offsetMatch != null) {
+        return int.tryParse(offsetMatch.group(1) ?? '') ?? 0;
+      }
+      final RegExpMatch? pageMatch = RegExp(
+        r'^page:(\d+):(\d+)$',
+      ).firstMatch(locatorValue);
+      if (pageMatch != null) {
+        return int.tryParse(pageMatch.group(1) ?? '') ?? 0;
+      }
+    }
+    return progress?.currentChapterIndex ?? 0;
+  }
+
+  int _restoreChapterTextOffset(
+    ReaderProgressModel? progress,
+    int chapterIndex,
+  ) {
+    final String? locatorValue = progress?.locatorValue;
+    if (locatorValue != null) {
+      final RegExpMatch? offsetMatch = RegExp(
+        r'^offset:(\d+):(\d+)$',
+      ).firstMatch(locatorValue);
+      if (offsetMatch != null) {
+        return int.tryParse(offsetMatch.group(2) ?? '') ?? 0;
+      }
+    }
+
+    final int? chapterOffset = progress?.chapterOffset;
+    if (chapterOffset != null) {
+      final ReaderChapterModel? chapter = _chapterByIndex(chapterIndex);
+      if (chapter == null) {
+        return chapterOffset;
+      }
+      return (chapterOffset - (chapter.startOffset ?? 0)).clamp(
+        0,
+        _readableText(chapter).length,
+      );
+    }
+    return 0;
+  }
+
+  int _pageIndexForChapterOffset(
+    List<_ReaderPageEntry> pages,
+    int chapterIndex,
+    int chapterOffset,
+  ) {
+    final int index = pages.indexWhere((_ReaderPageEntry entry) {
+      return entry.chapter.chapterIndex == chapterIndex &&
+          chapterOffset >= entry.chapterTextStart &&
+          chapterOffset < entry.chapterTextEnd;
+    });
+    if (index >= 0) {
+      return index;
+    }
+    final int firstIndex = pages.indexWhere(
       (_ReaderPageEntry entry) => entry.chapter.chapterIndex == chapterIndex,
     );
-    return fallback >= 0 ? fallback : 0;
+    if (firstIndex < 0) {
+      return -1;
+    }
+    final int lastIndex = pages.lastIndexWhere(
+      (_ReaderPageEntry entry) => entry.chapter.chapterIndex == chapterIndex,
+    );
+    return chapterOffset <= pages[firstIndex].chapterTextStart
+        ? firstIndex
+        : lastIndex;
+  }
+
+  ReaderChapterModel? _chapterByIndex(int chapterIndex) {
+    final ReaderBookDetail? detail = _detail;
+    if (detail == null) {
+      return null;
+    }
+    for (final ReaderChapterModel chapter in detail.chapters) {
+      if (chapter.chapterIndex == chapterIndex) {
+        return chapter;
+      }
+    }
+    return null;
   }
 
   void _onPageChanged(int index) {
     _globalPageIndex = index;
     _saveDebounce?.cancel();
     _saveDebounce = Timer(const Duration(milliseconds: 700), _saveProgress);
+    _prepaginateAroundCurrentPage();
     if (mounted) {
-      setState(() {});
+      setState(() {
+        _chromeVisible = false;
+      });
     }
   }
 
@@ -269,33 +425,53 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     final _ReaderPageEntry entry =
         _pages[_globalPageIndex.clamp(0, math.max(0, _pages.length - 1))];
     final ReaderChapterModel chapter = entry.chapter;
-    final double chapterProgress = entry.pageCountInChapter <= 1
+    final int globalOffset =
+        entry.globalReadableOffset + entry.chapterTextStart;
+    final int totalReadableLength = _totalReadableLength(detail);
+    final double progressPercent = totalReadableLength <= 0
         ? 0
-        : entry.pageInChapter / math.max(1, entry.pageCountInChapter - 1);
-    final double progressPercent =
-        ((chapter.chapterIndex + chapterProgress) /
-                math.max(1, detail.chapters.length))
-            .clamp(0, 1);
+        : (globalOffset / totalReadableLength).clamp(0, 1);
     final int now = DateTime.now().millisecondsSinceEpoch;
     final int totalMinutes =
         (detail.progress?.totalReadingMinutes ?? 0) +
         DateTime.now().difference(_openedAt).inMinutes;
 
-    await ref
-        .read(readerRepositoryProvider)
-        .saveProgress(
-          bookId: widget.bookId,
-          currentChapterIndex: chapter.chapterIndex,
-          chapterOffset: _chapterOffsetForPage(chapter, entry),
-          scrollOffset: _globalPageIndex.toDouble(),
-          progressPercent: progressPercent,
-          locatorType: 'chapter_page',
-          locatorValue: 'page:${chapter.chapterIndex}:${entry.pageInChapter}',
-          lastReadAtMillis: now,
-          updatedAtMillis: now,
-          totalReadingMinutes: totalMinutes,
-        );
+    await _readerRepository.saveProgress(
+      bookId: widget.bookId,
+      currentChapterIndex: chapter.chapterIndex,
+      chapterOffset: _chapterOffsetForPage(chapter, entry),
+      scrollOffset: entry.pageInChapter.toDouble(),
+      progressPercent: progressPercent,
+      locatorType: 'chapter_offset',
+      locatorValue: 'offset:${chapter.chapterIndex}:${entry.chapterTextStart}',
+      lastReadAtMillis: now,
+      updatedAtMillis: now,
+      totalReadingMinutes: totalMinutes,
+    );
     _openedAt = DateTime.now();
+  }
+
+  int _totalReadableLength(ReaderBookDetail detail) {
+    int total = 0;
+    for (final ReaderChapterModel chapter in detail.chapters) {
+      total += _readableText(chapter).trim().length;
+    }
+    return total;
+  }
+
+  int _readableOffsetBeforeChapter(int chapterIndex) {
+    final ReaderBookDetail? detail = _detail;
+    if (detail == null) {
+      return 0;
+    }
+    int total = 0;
+    for (final ReaderChapterModel chapter in detail.chapters) {
+      if (chapter.chapterIndex == chapterIndex) {
+        return total;
+      }
+      total += _readableText(chapter).trim().length;
+    }
+    return total;
   }
 
   int? _chapterOffsetForPage(
@@ -303,33 +479,21 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     _ReaderPageEntry entry,
   ) {
     final int? startOffset = chapter.startOffset;
-    final int? endOffset = chapter.endOffset;
-    if (startOffset == null || endOffset == null || endOffset <= startOffset) {
-      return null;
+    if (startOffset == null) {
+      return entry.chapterTextStart;
     }
-    final double ratio = entry.pageCountInChapter <= 1
-        ? 0
-        : entry.pageInChapter / math.max(1, entry.pageCountInChapter - 1);
-    return startOffset + ((endOffset - startOffset) * ratio).round();
+    return startOffset + entry.chapterTextStart;
   }
 
   Future<void> _goToChapter(int chapterIndex) async {
     await _saveProgress();
-    final int targetIndex = _pages.indexWhere(
-      (_ReaderPageEntry entry) => entry.chapter.chapterIndex == chapterIndex,
-    );
-    if (targetIndex < 0) {
+    final ReaderChapterModel? chapter = _chapterByIndex(chapterIndex);
+    if (chapter == null) {
       return;
     }
-    setState(() {
-      _globalPageIndex = targetIndex;
-    });
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_pageController.hasClients) {
-        _pageController.jumpToPage(targetIndex);
-      }
-      _saveProgress();
-    });
+    _paginationAnchor = _ReaderPageEntry.anchor(chapter: chapter);
+    _paginationSignature = null;
+    _ensurePaginationFromLastLayout();
   }
 
   void _handleTapUp(TapUpDetails details, BuildContext context) {
@@ -337,11 +501,114 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     final double dx = details.localPosition.dx;
     final double leftBound = width * 0.33;
     final double rightBound = width * 0.67;
-    if (dx >= leftBound && dx <= rightBound) {
-      setState(() {
-        _chromeVisible = !_chromeVisible;
-      });
+    if (dx < leftBound) {
+      _goToAdjacentPage(-1);
+      return;
     }
+    if (dx > rightBound) {
+      _goToAdjacentPage(1);
+      return;
+    }
+    setState(() {
+      _chromeVisible = !_chromeVisible;
+    });
+  }
+
+  void _goToAdjacentPage(int delta) {
+    if (_pages.isEmpty) {
+      return;
+    }
+    final int targetIndex = _globalPageIndex + delta;
+    if (targetIndex < 0 || targetIndex >= _pages.length) {
+      if (_goToAdjacentChapter(delta)) {
+        return;
+      }
+      _showPageBoundary(delta < 0 ? '已经是第一页' : '已经是最后一页');
+      return;
+    }
+    setState(() {
+      _chromeVisible = false;
+      _globalPageIndex = targetIndex;
+    });
+    if (_pageController.hasClients) {
+      _pageController.animateToPage(
+        targetIndex,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOutCubic,
+      );
+    }
+    _prepaginateAroundCurrentPage();
+  }
+
+  bool _goToAdjacentChapter(int delta) {
+    final ReaderBookDetail? detail = _detail;
+    final String? signature = _paginationSignature;
+    final _ReaderLayoutSnapshot? snapshot = _layoutSnapshot;
+    if (detail == null ||
+        signature == null ||
+        snapshot == null ||
+        _pages.isEmpty) {
+      return false;
+    }
+    final _ReaderPageEntry currentEntry =
+        _pages[_globalPageIndex.clamp(0, math.max(0, _pages.length - 1))];
+    final int targetChapterIndex = currentEntry.chapter.chapterIndex + delta;
+    if (targetChapterIndex < 0 ||
+        targetChapterIndex >= detail.chapters.length) {
+      return false;
+    }
+    final List<_ReaderPageEntry> nextPages = _composeChapterWindow(
+      detail: detail,
+      centerChapterIndex: targetChapterIndex,
+      signature: signature,
+      settings: _settings,
+      viewportSize: snapshot.viewportSize,
+      textScaler: snapshot.textScaler,
+      context: context,
+    );
+    final int targetOffset = delta > 0 ? 0 : 1 << 30;
+    final int nextIndex = _pageIndexForChapterOffset(
+      nextPages,
+      targetChapterIndex,
+      targetOffset,
+    ).clamp(0, math.max(0, nextPages.length - 1));
+    final int currentIndexInNextPages = _pageIndexForChapterOffset(
+      nextPages,
+      currentEntry.chapter.chapterIndex,
+      currentEntry.chapterTextStart,
+    ).clamp(0, math.max(0, nextPages.length - 1));
+    setState(() {
+      _pages = nextPages;
+      _globalPageIndex = currentIndexInNextPages;
+      _chromeVisible = false;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_pageController.hasClients && nextPages.isNotEmpty) {
+        _pageController.jumpToPage(currentIndexInNextPages);
+        _pageController.animateToPage(
+          nextIndex,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+        );
+      }
+      _prepaginateAroundCurrentPage();
+    });
+    return true;
+  }
+
+  void _showPageBoundary(String message) {
+    if (!mounted) {
+      return;
+    }
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(message),
+          duration: const Duration(milliseconds: 900),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
   }
 
   void _openToc() {
@@ -359,72 +626,432 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
   void _setThemeMode(_ReaderThemeMode mode) {
     final _ReaderUiSettings nextSettings = switch (mode) {
       _ReaderThemeMode.day => _settings.copyWith(
-          themeMode: mode,
-          backgroundId: _ReaderBackgroundStyle.paper.id,
-        ),
+        themeMode: mode,
+        backgroundId: _ReaderBackgroundStyle.paper.id,
+      ),
       _ReaderThemeMode.night => _settings.copyWith(
-          themeMode: mode,
-          backgroundId: _ReaderBackgroundStyle.midnight.id,
-        ),
+        themeMode: mode,
+        backgroundId: _ReaderBackgroundStyle.midnight.id,
+      ),
       _ReaderThemeMode.system => _settings.copyWith(themeMode: mode),
     };
     _rebuildPagesForSettings(nextSettings);
   }
 
   void _rebuildPagesForSettings(_ReaderUiSettings nextSettings) {
-    final ReaderBookDetail? detail = _detail;
     final _ReaderPageEntry? currentEntry = _pages.isEmpty
         ? null
         : _pages[_globalPageIndex.clamp(0, _pages.length - 1)];
-    if (detail == null || currentEntry == null) {
-      setState(() {
-        _settings = nextSettings;
+    setState(() {
+      _settings = nextSettings;
+      _paginationSignature = null;
+      _paginationAnchor = currentEntry;
+      if (currentEntry != null) {
+        _globalPageIndex = 0;
+      }
+    });
+    _scheduleSettingsSave(nextSettings);
+  }
+
+  void _ensurePagination(
+    BuildContext context,
+    BoxConstraints constraints,
+    _ReaderPageEntry? anchorEntry,
+  ) {
+    final ReaderBookDetail? detail = _detail;
+    if (detail == null || _loading || constraints.maxWidth <= 0) {
+      return;
+    }
+    final Size viewportSize = Size(constraints.maxWidth, constraints.maxHeight);
+    final TextScaler textScaler = MediaQuery.textScalerOf(context);
+    _layoutSnapshot = _ReaderLayoutSnapshot(
+      viewportSize: viewportSize,
+      textScaler: textScaler,
+    );
+    final String signature = _paginationKey(
+      viewportSize,
+      _settings,
+      textScaler,
+      detail.book.id,
+      detail.chapters.length,
+      _totalReadableLength(detail),
+    );
+    final ReaderWarmupResult? preparedLaunch = ref
+        .read(readerLaunchWarmupServiceProvider)
+        .takePreparedLaunch(bookId: widget.bookId, signature: signature);
+    if (preparedLaunch != null && _pages.isEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _paginationSignature == signature) {
+          return;
+        }
+        final List<_ReaderPageEntry> pages = _pageEntriesFromWarmup(
+          detail,
+          preparedLaunch,
+        );
+        setState(() {
+          _pages = pages;
+          _globalPageIndex = preparedLaunch.initialPageIndex.clamp(
+            0,
+            math.max(0, pages.length - 1),
+          );
+          _paginationSignature = signature;
+          _paginationAnchor = null;
+        });
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_pageController.hasClients && pages.isNotEmpty) {
+            _pageController.jumpToPage(_globalPageIndex);
+          }
+          _prepaginateAroundCurrentPage();
+        });
       });
       return;
     }
+    if (_paginationSignature == signature && _pages.isNotEmpty) {
+      return;
+    }
 
-    final List<_ReaderPageEntry> nextPages = _buildBookPages(
-      detail,
-      nextSettings,
-    );
-    final List<_ReaderPageEntry> sameChapterPages = nextPages
-        .where(
-          (_ReaderPageEntry entry) =>
-              entry.chapter.chapterIndex == currentEntry.chapter.chapterIndex,
-        )
-        .toList(growable: false);
-    final double ratio = currentEntry.pageCountInChapter <= 1
-        ? 0
-        : currentEntry.pageInChapter /
-              math.max(1, currentEntry.pageCountInChapter - 1);
-    final int nextPageInChapter = sameChapterPages.isEmpty
-        ? 0
-        : (ratio * math.max(0, sameChapterPages.length - 1)).round();
-    final int targetIndex = nextPages.indexWhere(
-      (_ReaderPageEntry entry) =>
-          entry.chapter.chapterIndex == currentEntry.chapter.chapterIndex &&
-          entry.pageInChapter == nextPageInChapter,
-    );
-
-    setState(() {
-      _settings = nextSettings;
-      _pages = nextPages;
-      _globalPageIndex = targetIndex >= 0 ? targetIndex : 0;
-    });
-    _scheduleSettingsSave(nextSettings);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_pageController.hasClients) {
-        _pageController.jumpToPage(_globalPageIndex);
+      if (!mounted || _paginationSignature == signature) {
+        return;
       }
+      final _ReaderPageEntry? effectiveAnchor =
+          anchorEntry ??
+          (_pages.isEmpty
+              ? null
+              : _pages[_globalPageIndex.clamp(0, _pages.length - 1)]);
+      final int targetChapterIndex =
+          effectiveAnchor?.chapter.chapterIndex ??
+          _restoreChapterIndex(detail.progress);
+      final int targetOffset =
+          effectiveAnchor?.chapterTextStart ??
+          _restoreChapterTextOffset(detail.progress, targetChapterIndex);
+      final List<_ReaderPageEntry> pages = _composeChapterWindow(
+        detail: detail,
+        centerChapterIndex: targetChapterIndex,
+        signature: signature,
+        settings: _settings,
+        viewportSize: viewportSize,
+        textScaler: textScaler,
+        context: context,
+      );
+      final int nextIndex = _pageIndexForChapterOffset(
+        pages,
+        targetChapterIndex,
+        targetOffset,
+      ).clamp(0, math.max(0, pages.length - 1));
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _pages = pages;
+        _globalPageIndex = nextIndex;
+        _paginationSignature = signature;
+        _paginationAnchor = null;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_pageController.hasClients && pages.isNotEmpty) {
+          _pageController.jumpToPage(nextIndex);
+        }
+        _prepaginateAroundCurrentPage();
+      });
     });
+  }
+
+  List<_ReaderPageEntry> _composeChapterWindow({
+    required ReaderBookDetail detail,
+    required int centerChapterIndex,
+    required String signature,
+    required _ReaderUiSettings settings,
+    required Size viewportSize,
+    required TextScaler textScaler,
+    required BuildContext context,
+  }) {
+    final List<int> orderedIndices = _availableWindowChapterIndices(
+      detail,
+      centerChapterIndex,
+      signature,
+    );
+    final List<_ReaderPageEntry> pages = <_ReaderPageEntry>[];
+    for (final int chapterIndex in orderedIndices) {
+      final ReaderChapterModel? chapter = _chapterByIndex(chapterIndex);
+      if (chapter == null) {
+        continue;
+      }
+      pages.addAll(
+        _chapterPagesFor(
+          chapter: chapter,
+          signature: signature,
+          settings: settings,
+          viewportSize: viewportSize,
+          textScaler: textScaler,
+          context: context,
+        ),
+      );
+    }
+    return pages;
+  }
+
+  List<int> _availableWindowChapterIndices(
+    ReaderBookDetail detail,
+    int centerChapterIndex,
+    String signature,
+  ) {
+    final List<int> orderedIndices = <int>[];
+    final int previousChapter = centerChapterIndex - 1;
+    if (previousChapter >= 0 &&
+        _chapterPaginationCache.containsKey(
+          _chapterPaginationKey(signature, previousChapter),
+        )) {
+      orderedIndices.add(previousChapter);
+    }
+    orderedIndices.add(centerChapterIndex);
+    final int nextChapter = centerChapterIndex + 1;
+    if (nextChapter < detail.chapters.length &&
+        _chapterPaginationCache.containsKey(
+          _chapterPaginationKey(signature, nextChapter),
+        )) {
+      orderedIndices.add(nextChapter);
+    }
+    return orderedIndices;
+  }
+
+  List<_ReaderPageEntry> _chapterPagesFor({
+    required ReaderChapterModel chapter,
+    required String signature,
+    required _ReaderUiSettings settings,
+    required Size viewportSize,
+    required TextScaler textScaler,
+    required BuildContext context,
+  }) {
+    final String cacheKey = _chapterPaginationKey(
+      signature,
+      chapter.chapterIndex,
+    );
+    final List<_ReaderPageEntry>? cachedPages =
+        _chapterPaginationCache[cacheKey];
+    if (cachedPages != null) {
+      _touchChapterPagination(cacheKey, cachedPages);
+      return cachedPages;
+    }
+    final List<_ReaderPageEntry> pages = _buildChapterPages(
+      chapter,
+      settings,
+      viewportSize,
+      textScaler,
+      context,
+    );
+    _touchChapterPagination(cacheKey, pages);
+    return pages;
+  }
+
+  void _prepaginateAroundCurrentPage() {
+    final ReaderBookDetail? detail = _detail;
+    if (detail == null || _pages.isEmpty || _paginationSignature == null) {
+      return;
+    }
+    final _ReaderPageEntry entry =
+        _pages[_globalPageIndex.clamp(0, math.max(0, _pages.length - 1))];
+    final int chapterIndex = entry.chapter.chapterIndex;
+    final List<int> targets = <int>[
+      if (chapterIndex > 0) chapterIndex - 1,
+      if (chapterIndex < detail.chapters.length - 1) chapterIndex + 1,
+    ];
+    for (final int target in targets) {
+      final String cacheKey = _chapterPaginationKey(
+        _paginationSignature!,
+        target,
+      );
+      if (_chapterPaginationCache.containsKey(cacheKey) ||
+          _queuedPrepaginationKeys.contains(cacheKey)) {
+        continue;
+      }
+      _queuedPrepaginationKeys.add(cacheKey);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _paginationSignature == null) {
+          _queuedPrepaginationKeys.remove(cacheKey);
+          return;
+        }
+        final ReaderChapterModel? chapter = _chapterByIndex(target);
+        final _ReaderLayoutSnapshot? snapshot = _layoutSnapshot;
+        if (chapter == null || snapshot == null) {
+          _queuedPrepaginationKeys.remove(cacheKey);
+          return;
+        }
+        _chapterPagesFor(
+          chapter: chapter,
+          signature: _paginationSignature!,
+          settings: _settings,
+          viewportSize: snapshot.viewportSize,
+          textScaler: snapshot.textScaler,
+          context: context,
+        );
+        _queuedPrepaginationKeys.remove(cacheKey);
+      });
+    }
+  }
+
+  void _ensurePaginationFromLastLayout() {
+    setState(() {
+      _pages = const <_ReaderPageEntry>[];
+      _globalPageIndex = 0;
+    });
+  }
+
+  String _paginationKey(
+    Size viewportSize,
+    _ReaderUiSettings settings,
+    TextScaler textScaler,
+    String bookId,
+    int chapterCount,
+    int totalReadableLength,
+  ) {
+    return <Object>[
+      bookId,
+      chapterCount,
+      totalReadableLength,
+      viewportSize.width.round(),
+      viewportSize.height.round(),
+      textScaler.scale(100).round(),
+      settings.fontSize,
+      settings.lineHeight,
+      settings.pageMarginId,
+      settings.fontId,
+    ].join('|');
+  }
+
+  List<_ReaderPageEntry> _pageEntriesFromWarmup(
+    ReaderBookDetail detail,
+    ReaderWarmupResult preparedLaunch,
+  ) {
+    final ReaderChapterModel? chapter = _chapterByIndex(
+      preparedLaunch.chapterIndex,
+    );
+    if (chapter == null) {
+      return const <_ReaderPageEntry>[];
+    }
+    return preparedLaunch.pages
+        .map((ReaderWarmupPageData page) {
+          return _ReaderPageEntry(
+            chapter: chapter,
+            pageInChapter: page.pageInChapter,
+            pageCountInChapter: page.pageCountInChapter,
+            chapterTextStart: page.chapterTextStart,
+            chapterTextEnd: page.chapterTextEnd,
+            globalReadableOffset: page.globalReadableOffset,
+            content: page.content,
+            showsTitle: page.showsTitle,
+          );
+        })
+        .toList(growable: false);
+  }
+
+  String _chapterPaginationKey(String signature, int chapterIndex) {
+    return '$signature#$chapterIndex';
+  }
+
+  void _touchChapterPagination(String cacheKey, List<_ReaderPageEntry> pages) {
+    _chapterPaginationCache.remove(cacheKey);
+    _chapterPaginationCache[cacheKey] = pages;
+    while (_chapterPaginationCache.length > _maxChapterPaginationCacheEntries) {
+      _chapterPaginationCache.remove(_chapterPaginationCache.keys.first);
+    }
+  }
+
+  _ReaderPageLayout _pageLayoutFor(
+    _ReaderUiSettings settings,
+    Size viewportSize,
+    BuildContext context,
+  ) {
+    final _ReaderPageMargin margin = _ReaderPageMargin.values.firstWhere(
+      (_ReaderPageMargin item) => item.id == settings.pageMarginId,
+      orElse: () => _ReaderPageMargin.comfort,
+    );
+    final double contentWidth = math.max(
+      80,
+      viewportSize.width - margin.horizontalPadding * 2,
+    );
+    final TextPainter headerPainter = TextPainter(
+      text: TextSpan(text: '章节标题', style: _titleTextStyle(context)),
+      maxLines: 1,
+      textDirection: TextDirection.ltr,
+      textScaler: MediaQuery.textScalerOf(context),
+    )..layout(maxWidth: contentWidth);
+    final TextPainter displayTitlePainter = TextPainter(
+      text: TextSpan(text: '章节标题', style: _displayTitleTextStyle(context)),
+      maxLines: 2,
+      textDirection: TextDirection.ltr,
+      textScaler: MediaQuery.textScalerOf(context),
+    )..layout(maxWidth: contentWidth);
+    final double availableHeight = math.max(
+      80,
+      viewportSize.height - _readerPageTopPadding - _readerPageBottomPadding,
+    );
+    final double followingPageBodyHeight = math.max(
+      80,
+      availableHeight - headerPainter.height - _readerHeaderGap,
+    );
+    final double firstPageBodyHeight = math.max(
+      80,
+      followingPageBodyHeight -
+          displayTitlePainter.height -
+          _readerDisplayTitleGap,
+    );
+    return _ReaderPageLayout(
+      contentWidth: contentWidth,
+      firstPageBodyHeight: firstPageBodyHeight,
+      followingPageBodyHeight: followingPageBodyHeight,
+    );
+  }
+
+  TextStyle _bodyTextStyle(_ReaderUiSettings settings, BuildContext context) {
+    final _ReaderBackgroundStyle backgroundStyle = _resolvedBackgroundStyle(
+      context,
+    );
+    final _ReaderFontOption font = _ReaderFontOption.values.firstWhere(
+      (_ReaderFontOption item) => item.id == settings.fontId,
+      orElse: () => _ReaderFontOption.system,
+    );
+    return TextStyle(
+      fontSize: settings.renderFontSize,
+      height: settings.lineHeight,
+      color: backgroundStyle.textColor,
+      letterSpacing: 0.6,
+      fontWeight: FontWeight.w400,
+      fontFamily: font.fontFamily,
+      fontFamilyFallback: font.fontFamilyFallback,
+    );
+  }
+
+  TextStyle _titleTextStyle(BuildContext context) {
+    final _ReaderBackgroundStyle backgroundStyle = _resolvedBackgroundStyle(
+      context,
+    );
+    return TextStyle(
+      fontSize: 15,
+      height: 1.2,
+      fontWeight: FontWeight.w500,
+      color: backgroundStyle.mutedColor,
+      letterSpacing: 0.3,
+    );
+  }
+
+  TextStyle _displayTitleTextStyle(BuildContext context) {
+    final _ReaderBackgroundStyle backgroundStyle = _resolvedBackgroundStyle(
+      context,
+    );
+    return TextStyle(
+      fontSize: 26,
+      height: 1.28,
+      fontWeight: FontWeight.w700,
+      color: backgroundStyle.textColor,
+      letterSpacing: 0.2,
+    );
   }
 
   void _scheduleSettingsSave(_ReaderUiSettings settings) {
     _settingsSaveDebounce?.cancel();
     _settingsSaveDebounce = Timer(const Duration(milliseconds: 250), () async {
-      await ref
-          .read(readerRepositoryProvider)
-          .saveReaderSettings(settings.toModel());
+      await _readerRepository.saveReaderSettings(settings.toModel());
     });
   }
 
@@ -496,7 +1123,9 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
         body: Stack(
           children: <Widget>[
             Positioned.fill(child: _buildBody()),
-            if (_chromeVisible && _detail != null && currentEntry != null) ...<Widget>[
+            if (_chromeVisible &&
+                _detail != null &&
+                currentEntry != null) ...<Widget>[
               _ReaderTopBar(
                 title: currentEntry.chapter.title,
                 textColor: textColor,
@@ -536,8 +1165,8 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
             ],
             if (_detail != null && currentEntry != null && !_chromeVisible)
               _ReaderPageProgress(
-                currentPage: _globalPageIndex + 1,
-                totalPages: _pages.length,
+                currentPage: currentEntry.pageInChapter + 1,
+                totalPages: currentEntry.pageCountInChapter,
                 color: mutedColor,
               ),
           ],
@@ -548,26 +1177,14 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
 
   Widget _buildBody() {
     if (_loading) {
-      return const UxStateView(
-        icon: Icons.menu_book_rounded,
-        title: '正在打开书籍',
-        message: '正文和目录正在准备，请稍候。',
-        iconBackgroundColor: Color(0xFFF1EBDD),
-        iconColor: Color(0xFF8C7A62),
-        titleColor: _ink,
-        messageColor: _muted,
-        primaryColor: Color(0xFF6B573F),
-        scrollable: true,
-      );
+      return _ReaderPreparingState(detail: _detail);
     }
     if (_errorMessage != null) {
       final bool missingBook = _errorMessage == '书籍不存在或已被删除';
       final bool emptyContent = _errorMessage == '这本书还没有可阅读章节';
       return _ReaderMessageState(
         title: missingBook ? '书籍已不可用' : '加载失败',
-        message: emptyContent
-            ? '当前文件没有解析出可阅读正文，请重新导入后再试。'
-            : _errorMessage!,
+        message: emptyContent ? '当前文件没有解析出可阅读正文，请重新导入后再试。' : _errorMessage!,
         primaryLabel: missingBook ? '返回书架' : '重新加载',
         onPrimaryAction: missingBook
             ? () {
@@ -577,33 +1194,45 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
       );
     }
     if (_detail == null || _pages.isEmpty) {
-      return const _ReaderMessageState(
-        title: '没有可阅读内容',
-        message: '当前章节内容为空，暂时无法继续阅读。',
+      return LayoutBuilder(
+        builder: (BuildContext context, BoxConstraints constraints) {
+          _ensurePagination(context, constraints, _paginationAnchor);
+          return _ReaderPreparingState(detail: _detail);
+        },
       );
     }
 
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTapUp: (TapUpDetails details) => _handleTapUp(details, context),
-      child: PageView.builder(
-        key: ValueKey<int>(_pages.length),
-        controller: _pageController,
-        itemCount: _pages.length,
-        onPageChanged: _onPageChanged,
-        itemBuilder: (BuildContext context, int index) {
-          final _ReaderPageEntry entry = _pages[index];
-          return _ReaderTextPage(
-            chapterTitle: entry.chapter.title,
-            text: entry.content,
-            showTitle: entry.showsTitle,
-            showHtml: entry.showHtml,
-            htmlContent: entry.chapter.htmlContent,
-            settings: _settings,
-            backgroundStyle: _resolvedBackgroundStyle(context),
-          );
-        },
-      ),
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        final _ReaderPageEntry? currentEntry = _pages.isEmpty
+            ? null
+            : _pages[_globalPageIndex.clamp(0, _pages.length - 1)];
+        _ensurePagination(
+          context,
+          constraints,
+          _paginationAnchor ?? currentEntry,
+        );
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapUp: (TapUpDetails details) => _handleTapUp(details, context),
+          child: PageView.builder(
+            key: ValueKey<String>(_paginationSignature ?? '${_pages.length}'),
+            controller: _pageController,
+            itemCount: _pages.length,
+            onPageChanged: _onPageChanged,
+            itemBuilder: (BuildContext context, int index) {
+              final _ReaderPageEntry entry = _pages[index];
+              return _ReaderTextPage(
+                chapterTitle: entry.chapter.title,
+                text: entry.content,
+                showTitle: entry.showsTitle,
+                settings: _settings,
+                backgroundStyle: _resolvedBackgroundStyle(context),
+              );
+            },
+          ),
+        );
+      },
     );
   }
 
@@ -621,8 +1250,6 @@ class _ReaderTextPage extends StatelessWidget {
     required this.chapterTitle,
     required this.text,
     required this.showTitle,
-    required this.showHtml,
-    required this.htmlContent,
     required this.settings,
     required this.backgroundStyle,
   });
@@ -630,8 +1257,6 @@ class _ReaderTextPage extends StatelessWidget {
   final String chapterTitle;
   final String text;
   final bool showTitle;
-  final bool showHtml;
-  final String? htmlContent;
   final _ReaderUiSettings settings;
   final _ReaderBackgroundStyle backgroundStyle;
 
@@ -654,44 +1279,58 @@ class _ReaderTextPage extends StatelessWidget {
       fontFamily: font.fontFamily,
       fontFamilyFallback: font.fontFamilyFallback,
     );
+    final TextStyle headerStyle = TextStyle(
+      fontSize: 15,
+      height: 1.2,
+      fontWeight: FontWeight.w500,
+      color: backgroundStyle.mutedColor,
+      letterSpacing: 0.3,
+    );
+    final TextStyle displayTitleStyle = TextStyle(
+      fontSize: 26,
+      height: 1.28,
+      fontWeight: FontWeight.w700,
+      color: backgroundStyle.textColor,
+      letterSpacing: 0.2,
+    );
     return Padding(
       padding: EdgeInsets.fromLTRB(
         margin.horizontalPadding,
-        44,
+        _readerPageTopPadding,
         margin.horizontalPadding,
-        48,
+        _readerPageBottomPadding,
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
+          Text(
+            chapterTitle,
+            maxLines: 1,
+            overflow: TextOverflow.fade,
+            softWrap: false,
+            style: headerStyle,
+          ),
+          const SizedBox(height: _readerHeaderGap),
           if (showTitle) ...<Widget>[
             Text(
               chapterTitle,
-              maxLines: 1,
-              overflow: TextOverflow.fade,
-              softWrap: false,
-              style: TextStyle(
-                fontSize: 15,
-                height: 1.2,
-                fontWeight: FontWeight.w500,
-                color: backgroundStyle.mutedColor,
-                letterSpacing: 0.3,
-              ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: displayTitleStyle,
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: _readerDisplayTitleGap),
           ],
           Expanded(
             child: ClipRect(
-              child: showHtml
-                  ? HtmlWidget(
-                      htmlContent!,
-                      textStyle: bodyStyle,
-                    )
-                  : Text(
-                      _displayText(text),
-                      textAlign: TextAlign.justify,
-                      style: bodyStyle,
-                    ),
+              child: Text(
+                _displayText(
+                  showTitle
+                      ? _stripLeadingDuplicateTitle(text, chapterTitle)
+                      : text,
+                ),
+                textAlign: TextAlign.justify,
+                style: bodyStyle,
+              ),
             ),
           ),
         ],
@@ -709,6 +1348,19 @@ class _ReaderTextPage extends StatelessWidget {
       return value;
     }
     return lines.join('\n');
+  }
+
+  String _stripLeadingDuplicateTitle(String body, String title) {
+    final String normalizedBody = body.trimLeft();
+    final String normalizedTitle = title.trim();
+    if (normalizedTitle.isEmpty ||
+        !normalizedBody.startsWith(normalizedTitle)) {
+      return body;
+    }
+
+    String remaining = normalizedBody.substring(normalizedTitle.length);
+    remaining = remaining.replaceFirst(RegExp(r'^[\s:：\-—_·.]+'), '');
+    return remaining.trimLeft();
   }
 }
 
@@ -927,6 +1579,10 @@ class _ReaderSettingsPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final double bottomInset = MediaQuery.of(context).padding.bottom;
+    final _ReaderPageMargin currentMargin = _ReaderPageMargin.values.firstWhere(
+      (_ReaderPageMargin item) => item.id == settings.pageMarginId,
+      orElse: () => _ReaderPageMargin.comfort,
+    );
     return Container(
       constraints: BoxConstraints(
         maxHeight: MediaQuery.of(context).size.height * 0.5,
@@ -991,74 +1647,39 @@ class _ReaderSettingsPanel extends StatelessWidget {
                 ],
               ),
               const SizedBox(height: 18),
-              _ReaderSettingSliderRow(
+              _ReaderSettingStepperRow(
                 label: '字号',
                 textColor: textColor,
-                leading: _ReaderStepButton(
-                  label: 'A-',
-                  chipColor: chipColor,
-                  onTap: () => onFontSizeChanged(
-                    (settings.fontSize - 1).clamp(14, 26),
-                  ),
-                ),
-                valueBadge: '${settings.fontSize.round()}',
+                valueLabel: '${settings.fontSize.round()}',
+                onDecrease: () =>
+                    onFontSizeChanged((settings.fontSize - 1).clamp(14, 26)),
+                onIncrease: () =>
+                    onFontSizeChanged((settings.fontSize + 1).clamp(14, 26)),
                 chipColor: chipColor,
-                trailing: _ReaderStepButton(
-                  label: 'A+',
-                  chipColor: chipColor,
-                  onTap: () => onFontSizeChanged(
-                    (settings.fontSize + 1).clamp(14, 26),
-                  ),
-                ),
-                sliderValue: settings.fontSize,
-                min: 14,
-                max: 26,
-                onChanged: onFontSizeChanged,
-                endLabel: 'A',
-                accentColor: accentColor,
               ),
               const SizedBox(height: 16),
-              _ReaderSettingSliderRow(
+              _ReaderSettingStepperRow(
                 label: '行高',
                 textColor: textColor,
-                leading: _ReaderIconChip(
-                  icon: Icons.short_text_rounded,
-                  chipColor: chipColor,
+                valueLabel: settings.lineHeight.toStringAsFixed(2),
+                onDecrease: () => onLineHeightChanged(
+                  (settings.lineHeight - 0.1).clamp(1.4, 2.2),
                 ),
-                trailing: _ReaderIconChip(
-                  icon: Icons.reorder_rounded,
-                  chipColor: chipColor,
+                onIncrease: () => onLineHeightChanged(
+                  (settings.lineHeight + 0.1).clamp(1.4, 2.2),
                 ),
-                sliderValue: settings.lineHeight,
-                min: 1.4,
-                max: 2.2,
-                onChanged: onLineHeightChanged,
-                accentColor: accentColor,
                 chipColor: chipColor,
               ),
               const SizedBox(height: 18),
-              _ReaderSettingGroupRow(
-                label: '页边距',
+              _ReaderSettingStepperRow(
+                label: '边距',
                 textColor: textColor,
-                child: Row(
-                  children: _ReaderPageMargin.values.map((_ReaderPageMargin item) {
-                    final bool selected = item.id == settings.pageMarginId;
-                    return Expanded(
-                      child: Padding(
-                        padding: EdgeInsets.only(
-                          right: item == _ReaderPageMargin.values.last ? 0 : 10,
-                        ),
-                      child: _ReaderMarginChip(
-                          margin: item,
-                          selected: selected,
-                          accentColor: accentColor,
-                          chipColor: chipColor,
-                          onTap: () => onPageMarginChanged(item),
-                        ),
-                      ),
-                    );
-                  }).toList(growable: false),
-                ),
+                valueLabel: currentMargin.label,
+                onDecrease: () =>
+                    onPageMarginChanged(_adjacentMargin(currentMargin, -1)),
+                onIncrease: () =>
+                    onPageMarginChanged(_adjacentMargin(currentMargin, 1)),
+                chipColor: chipColor,
               ),
               const SizedBox(height: 18),
               _ReaderSettingGroupRow(
@@ -1067,35 +1688,47 @@ class _ReaderSettingsPanel extends StatelessWidget {
                 child: Wrap(
                   spacing: 10,
                   runSpacing: 10,
-                  children: _ReaderFontOption.values.map((_ReaderFontOption font) {
-                    final bool selected = font.id == settings.fontId;
-                    return _ReaderChoiceChip(
-                      label: font.label,
-                      selected: selected,
-                      accentColor: accentColor,
-                      chipColor: chipColor,
-                      onTap: () => onFontChanged(font),
-                    );
-                  }).toList(growable: false),
+                  children: _ReaderFontOption.values
+                      .map((_ReaderFontOption font) {
+                        final bool selected = font.id == settings.fontId;
+                        return _ReaderChoiceChip(
+                          label: font.label,
+                          selected: selected,
+                          accentColor: accentColor,
+                          chipColor: chipColor,
+                          onTap: () => onFontChanged(font),
+                        );
+                      })
+                      .toList(growable: false),
                 ),
               ),
               const SizedBox(height: 18),
               _ReaderSettingGroupRow(
                 label: '背景',
                 textColor: textColor,
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: _ReaderBackgroundStyle.values.map((
-                    _ReaderBackgroundStyle style,
-                  ) {
-                    final bool selected = style.id == settings.backgroundId;
-                    return _ReaderBackgroundChip(
-                      style: style,
-                      selected: selected,
-                      accentColor: accentColor,
-                      onTap: () => onBackgroundChanged(style),
-                    );
-                  }).toList(growable: false),
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: _ReaderBackgroundStyle.values
+                        .map((_ReaderBackgroundStyle style) {
+                          final bool selected =
+                              style.id == settings.backgroundId;
+                          return Padding(
+                            padding: EdgeInsets.only(
+                              right: style == _ReaderBackgroundStyle.values.last
+                                  ? 0
+                                  : 10,
+                            ),
+                            child: _ReaderBackgroundChip(
+                              style: style,
+                              selected: selected,
+                              accentColor: accentColor,
+                              onTap: () => onBackgroundChanged(style),
+                            ),
+                          );
+                        })
+                        .toList(growable: false),
+                  ),
                 ),
               ),
               const SizedBox(height: 18),
@@ -1103,23 +1736,27 @@ class _ReaderSettingsPanel extends StatelessWidget {
                 label: '主题模式',
                 textColor: textColor,
                 child: Row(
-                  children: _ReaderThemeMode.values.map((_ReaderThemeMode mode) {
-                    final bool selected = mode == settings.themeMode;
-                    return Expanded(
-                      child: Padding(
-                        padding: EdgeInsets.only(
-                          right: mode == _ReaderThemeMode.values.last ? 0 : 10,
-                        ),
-                        child: _ReaderThemeModeChip(
-                          mode: mode,
-                          selected: selected,
-                          accentColor: accentColor,
-                          chipColor: chipColor,
-                          onTap: () => onThemeModeChanged(mode),
-                        ),
-                      ),
-                    );
-                  }).toList(growable: false),
+                  children: _ReaderThemeMode.values
+                      .map((_ReaderThemeMode mode) {
+                        final bool selected = mode == settings.themeMode;
+                        return Expanded(
+                          child: Padding(
+                            padding: EdgeInsets.only(
+                              right: mode == _ReaderThemeMode.values.last
+                                  ? 0
+                                  : 10,
+                            ),
+                            child: _ReaderThemeModeChip(
+                              mode: mode,
+                              selected: selected,
+                              accentColor: accentColor,
+                              chipColor: chipColor,
+                              onTap: () => onThemeModeChanged(mode),
+                            ),
+                          ),
+                        );
+                      })
+                      .toList(growable: false),
                 ),
               ),
               const SizedBox(height: 22),
@@ -1157,41 +1794,37 @@ class _ReaderSettingsPanel extends StatelessWidget {
       ),
     );
   }
+
+  _ReaderPageMargin _adjacentMargin(_ReaderPageMargin current, int step) {
+    final int currentIndex = _ReaderPageMargin.values.indexOf(current);
+    final int nextIndex = (currentIndex + step).clamp(
+      0,
+      _ReaderPageMargin.values.length - 1,
+    );
+    return _ReaderPageMargin.values[nextIndex];
+  }
 }
 
-class _ReaderSettingSliderRow extends StatelessWidget {
-  const _ReaderSettingSliderRow({
+class _ReaderSettingStepperRow extends StatelessWidget {
+  const _ReaderSettingStepperRow({
     required this.label,
     required this.textColor,
-    required this.sliderValue,
-    required this.min,
-    required this.max,
-    required this.onChanged,
-    required this.accentColor,
+    required this.valueLabel,
+    required this.onDecrease,
+    required this.onIncrease,
     required this.chipColor,
-    this.leading,
-    this.valueBadge,
-    this.trailing,
-    this.endLabel,
   });
 
   final String label;
   final Color textColor;
-  final Widget? leading;
-  final String? valueBadge;
-  final Widget? trailing;
-  final double sliderValue;
-  final double min;
-  final double max;
-  final ValueChanged<double> onChanged;
-  final String? endLabel;
-  final Color accentColor;
+  final String valueLabel;
+  final VoidCallback onDecrease;
+  final VoidCallback onIncrease;
   final Color chipColor;
 
   @override
   Widget build(BuildContext context) {
     return Row(
-      crossAxisAlignment: CrossAxisAlignment.center,
       children: <Widget>[
         SizedBox(
           width: 54,
@@ -1204,46 +1837,31 @@ class _ReaderSettingSliderRow extends StatelessWidget {
             ),
           ),
         ),
-        ...?leading == null ? null : <Widget>[leading!],
-        if (valueBadge != null) ...<Widget>[
-          const SizedBox(width: 10),
-          _ReaderValueBadge(label: valueBadge!, chipColor: chipColor),
-        ],
-        if (trailing != null) ...<Widget>[
-          const SizedBox(width: 10),
-          trailing!,
-        ],
-        const SizedBox(width: 12),
+        const SizedBox(width: 10),
+        _ReaderStepButton(label: '-', chipColor: chipColor, onTap: onDecrease),
+        const SizedBox(width: 10),
         Expanded(
-          child: SliderTheme(
-            data: SliderTheme.of(context).copyWith(
-              trackHeight: 3,
-              inactiveTrackColor: const Color(0xFFE3E3E3),
-              activeTrackColor: accentColor,
-              thumbColor: accentColor,
-              overlayShape: SliderComponentShape.noOverlay,
+          child: Container(
+            height: 48,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: chipColor,
+              borderRadius: BorderRadius.circular(14),
             ),
-            child: Slider(
-              value: sliderValue.clamp(min, max),
-              min: min,
-              max: max,
-              onChanged: onChanged,
-            ),
-          ),
-        ),
-        if (endLabel != null) ...<Widget>[
-          const SizedBox(width: 8),
-          SizedBox(
-            width: 24,
             child: Text(
-              endLabel!,
+              valueLabel,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: TextStyle(
-                fontSize: 18,
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
                 color: textColor,
               ),
             ),
           ),
-        ],
+        ),
+        const SizedBox(width: 10),
+        _ReaderStepButton(label: '+', chipColor: chipColor, onTap: onIncrease),
       ],
     );
   }
@@ -1306,50 +1924,8 @@ class _ReaderStepButton extends StatelessWidget {
       chipColor: chipColor,
       child: Text(
         label,
-        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
+        style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w500),
       ),
-    );
-  }
-}
-
-class _ReaderValueBadge extends StatelessWidget {
-  const _ReaderValueBadge({required this.label, required this.chipColor});
-
-  final String label;
-  final Color chipColor;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 48,
-      height: 48,
-      alignment: Alignment.center,
-      decoration: BoxDecoration(
-        color: chipColor,
-        borderRadius: BorderRadius.circular(14),
-      ),
-      child: Text(
-        label,
-        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
-      ),
-    );
-  }
-}
-
-class _ReaderIconChip extends StatelessWidget {
-  const _ReaderIconChip({required this.icon, required this.chipColor});
-
-  final IconData icon;
-  final Color chipColor;
-
-  @override
-  Widget build(BuildContext context) {
-    return _ReaderChoiceSurface(
-      width: 52,
-      height: 48,
-      onTap: () {},
-      chipColor: chipColor,
-      child: Icon(icon, size: 24),
     );
   }
 }
@@ -1471,41 +2047,6 @@ class _ReaderBackgroundChip extends StatelessWidget {
   }
 }
 
-class _ReaderMarginChip extends StatelessWidget {
-  const _ReaderMarginChip({
-    required this.margin,
-    required this.selected,
-    required this.accentColor,
-    required this.chipColor,
-    required this.onTap,
-  });
-
-  final _ReaderPageMargin margin;
-  final bool selected;
-  final Color accentColor;
-  final Color chipColor;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return _ReaderChoiceSurface(
-      width: double.infinity,
-      height: 56,
-      onTap: onTap,
-      selected: selected,
-      accentColor: accentColor,
-      chipColor: chipColor,
-      child: CustomPaint(
-        painter: _ReaderMarginPainter(
-          lineColor: selected ? accentColor : const Color(0xFF4B4B4B),
-          inset: margin.previewInset,
-        ),
-        child: const SizedBox.expand(),
-      ),
-    );
-  }
-}
-
 class _ReaderChoiceSurface extends StatelessWidget {
   const _ReaderChoiceSurface({
     required this.width,
@@ -1547,45 +2088,6 @@ class _ReaderChoiceSurface extends StatelessWidget {
   }
 }
 
-class _ReaderMarginPainter extends CustomPainter {
-  const _ReaderMarginPainter({required this.lineColor, required this.inset});
-
-  final Color lineColor;
-  final double inset;
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final Paint stroke = Paint()
-      ..color = lineColor
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.6;
-    final Paint fill = Paint()
-      ..color = lineColor
-      ..strokeWidth = 1.4;
-    final Rect rect = Rect.fromLTWH(
-      inset,
-      10,
-      size.width - inset * 2,
-      size.height - 20,
-    );
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(rect, const Radius.circular(6)),
-      stroke,
-    );
-    final double lineStart = rect.left + 8;
-    final double lineEnd = rect.right - 8;
-    for (int i = 0; i < 3; i += 1) {
-      final double y = rect.top + 8 + i * 8;
-      canvas.drawLine(Offset(lineStart, y), Offset(lineEnd, y), fill);
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _ReaderMarginPainter oldDelegate) {
-    return oldDelegate.lineColor != lineColor || oldDelegate.inset != inset;
-  }
-}
-
 class _ReaderUiSettings {
   const _ReaderUiSettings({
     required this.fontSize,
@@ -1611,11 +2113,11 @@ class _ReaderUiSettings {
     return _ReaderUiSettings(
       fontSize: model.fontSize,
       lineHeight: model.lineHeight,
-      pageMarginId: _ReaderPageMargin.values
-              .any(
-                (_ReaderPageMargin margin) =>
-                    margin.horizontalPadding == model.horizontalPadding,
-              )
+      pageMarginId:
+          _ReaderPageMargin.values.any(
+            (_ReaderPageMargin margin) =>
+                margin.horizontalPadding == model.horizontalPadding,
+          )
           ? _ReaderPageMargin.values
                 .firstWhere(
                   (_ReaderPageMargin margin) =>
@@ -1623,15 +2125,17 @@ class _ReaderUiSettings {
                 )
                 .id
           : 'comfort',
-      fontId: _ReaderFontOption.values.any(
-        (_ReaderFontOption font) => font.id == model.fontFamilyId,
-      )
+      fontId:
+          _ReaderFontOption.values.any(
+            (_ReaderFontOption font) => font.id == model.fontFamilyId,
+          )
           ? model.fontFamilyId
           : 'system',
-      backgroundId: _ReaderBackgroundStyle.values.any(
-        (_ReaderBackgroundStyle background) =>
-            background.id == model.backgroundStyleId,
-      )
+      backgroundId:
+          _ReaderBackgroundStyle.values.any(
+            (_ReaderBackgroundStyle background) =>
+                background.id == model.backgroundStyleId,
+          )
           ? model.backgroundStyleId
           : 'paper',
       themeMode: _ReaderThemeMode.values.firstWhere(
@@ -1713,36 +2217,30 @@ enum _ReaderThemeMode {
 }
 
 enum _ReaderFontOption {
-  system(
-    'system',
-    '系统默认',
-    null,
-    <String>['PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei'],
-  ),
-  sans(
-    'sans',
-    '思源黑体',
-    'ReaderNotoSansSC',
-    <String>['PingFang SC', 'Noto Sans CJK SC', 'Microsoft YaHei', 'sans-serif'],
-  ),
-  song(
-    'song',
-    '思源宋体',
-    'ReaderNotoSerifSC',
-    <String>['Songti SC', 'STSong', 'Noto Serif CJK SC', 'serif'],
-  ),
-  wenkai(
-    'wenkai',
-    '霞鹜文楷',
-    'ReaderLXGWWenKai',
-    <String>['Kaiti SC', 'STKaiti', 'KaiTi', 'serif'],
-  ),
-  mono(
-    'mono',
-    '等宽',
-    'Menlo',
-    <String>['SF Mono', 'Roboto Mono', 'monospace'],
-  );
+  system('system', '系统默认', null, <String>[
+    'PingFang SC',
+    'Noto Sans CJK SC',
+    'Microsoft YaHei',
+  ]),
+  sans('sans', '思源黑体', 'ReaderNotoSansSC', <String>[
+    'PingFang SC',
+    'Noto Sans CJK SC',
+    'Microsoft YaHei',
+    'sans-serif',
+  ]),
+  song('song', '思源宋体', 'ReaderNotoSerifSC', <String>[
+    'Songti SC',
+    'STSong',
+    'Noto Serif CJK SC',
+    'serif',
+  ]),
+  wenkai('wenkai', '霞鹜文楷', 'ReaderLXGWWenKai', <String>[
+    'Kaiti SC',
+    'STKaiti',
+    'KaiTi',
+    'serif',
+  ]),
+  mono('mono', '等宽', 'Menlo', <String>['SF Mono', 'Roboto Mono', 'monospace']);
 
   const _ReaderFontOption(
     this.id,
@@ -1758,62 +2256,27 @@ enum _ReaderFontOption {
 }
 
 enum _ReaderPageMargin {
-  compact('compact', 20, 16),
-  comfort('comfort', 26, 12),
-  relaxed('relaxed', 32, 22),
-  wide('wide', 38, 18),
-  extra('extra', 44, 14);
+  compact('compact', '紧凑', 20),
+  comfort('comfort', '适中', 26),
+  relaxed('relaxed', '舒适', 32),
+  wide('wide', '宽松', 38),
+  extra('extra', '极宽', 44);
 
-  const _ReaderPageMargin(this.id, this.horizontalPadding, this.previewInset);
+  const _ReaderPageMargin(this.id, this.label, this.horizontalPadding);
 
   final String id;
+  final String label;
   final double horizontalPadding;
-  final double previewInset;
 }
 
 enum _ReaderBackgroundStyle {
-  paper(
-    'paper',
-    Color(0xFFF6F1E9),
-    Color(0xFF111111),
-    Color(0xFF8C918B),
-  ),
-  mist(
-    'mist',
-    Color(0xFFF5F5F3),
-    Color(0xFF1D1D1D),
-    Color(0xFF898989),
-  ),
-  wheat(
-    'wheat',
-    Color(0xFFF3E2C5),
-    Color(0xFF251E14),
-    Color(0xFF85705A),
-  ),
-  sage(
-    'sage',
-    Color(0xFFDCE6D5),
-    Color(0xFF1D281F),
-    Color(0xFF647065),
-  ),
-  fog(
-    'fog',
-    Color(0xFFD9D9DD),
-    Color(0xFF212121),
-    Color(0xFF666872),
-  ),
-  charcoal(
-    'charcoal',
-    Color(0xFF6B6B6D),
-    Color(0xFFF7F7F7),
-    Color(0xFFD4D4D4),
-  ),
-  midnight(
-    'midnight',
-    Color(0xFF111111),
-    Color(0xFFF5F5F5),
-    Color(0xFFBBBBBB),
-  );
+  paper('paper', Color(0xFFF6F1E9), Color(0xFF111111), Color(0xFF8C918B)),
+  mist('mist', Color(0xFFF5F5F3), Color(0xFF1D1D1D), Color(0xFF898989)),
+  wheat('wheat', Color(0xFFF3E2C5), Color(0xFF251E14), Color(0xFF85705A)),
+  sage('sage', Color(0xFFDCE6D5), Color(0xFF1D281F), Color(0xFF647065)),
+  fog('fog', Color(0xFFD9D9DD), Color(0xFF212121), Color(0xFF666872)),
+  charcoal('charcoal', Color(0xFF6B6B6D), Color(0xFFF7F7F7), Color(0xFFD4D4D4)),
+  midnight('midnight', Color(0xFF111111), Color(0xFFF5F5F5), Color(0xFFBBBBBB));
 
   const _ReaderBackgroundStyle(
     this.id,
@@ -1869,20 +2332,152 @@ class _ReaderMessageState extends StatelessWidget {
   }
 }
 
+class _ReaderPreparingState extends StatelessWidget {
+  const _ReaderPreparingState({required this.detail});
+
+  final ReaderBookDetail? detail;
+
+  @override
+  Widget build(BuildContext context) {
+    final String? coverImagePath = detail?.book.coverImagePath;
+    final String? existingCoverImagePath =
+        coverImagePath != null && File(coverImagePath).existsSync()
+        ? coverImagePath
+        : null;
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: <Color>[Color(0xFFF7F2E8), Color(0xFFEAE0CF)],
+        ),
+      ),
+      child: Center(
+        child: AnimatedSwitcher(
+          duration: const Duration(milliseconds: 220),
+          child: existingCoverImagePath != null
+              ? Container(
+                  key: ValueKey<String>(existingCoverImagePath),
+                  width: 168,
+                  height: 236,
+                  clipBehavior: Clip.antiAlias,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(16),
+                    boxShadow: const <BoxShadow>[
+                      BoxShadow(
+                        color: Color(0x22000000),
+                        blurRadius: 24,
+                        offset: Offset(0, 12),
+                      ),
+                    ],
+                  ),
+                  child: Image.file(
+                    File(existingCoverImagePath),
+                    fit: BoxFit.cover,
+                  ),
+                )
+              : Container(
+                  key: const ValueKey<String>('reader-placeholder-cover'),
+                  width: 168,
+                  height: 236,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(16),
+                    gradient: const LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: <Color>[Color(0xFFD9C6A5), Color(0xFFB79B70)],
+                    ),
+                    boxShadow: const <BoxShadow>[
+                      BoxShadow(
+                        color: Color(0x22000000),
+                        blurRadius: 24,
+                        offset: Offset(0, 12),
+                      ),
+                    ],
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+}
+
 class _ReaderPageEntry {
   const _ReaderPageEntry({
     required this.chapter,
     required this.pageInChapter,
     required this.pageCountInChapter,
+    required this.chapterTextStart,
+    required this.chapterTextEnd,
+    required this.globalReadableOffset,
     required this.content,
     required this.showsTitle,
-    required this.showHtml,
   });
+
+  factory _ReaderPageEntry.anchor({
+    required ReaderChapterModel chapter,
+    int chapterTextStart = 0,
+  }) {
+    return _ReaderPageEntry(
+      chapter: chapter,
+      pageInChapter: 0,
+      pageCountInChapter: 1,
+      chapterTextStart: chapterTextStart,
+      chapterTextEnd: chapterTextStart,
+      globalReadableOffset: 0,
+      content: '',
+      showsTitle: false,
+    );
+  }
 
   final ReaderChapterModel chapter;
   final int pageInChapter;
   final int pageCountInChapter;
+  final int chapterTextStart;
+  final int chapterTextEnd;
+  final int globalReadableOffset;
   final String content;
   final bool showsTitle;
-  final bool showHtml;
+
+  _ReaderPageEntry copyWith({int? globalReadableOffset}) {
+    return _ReaderPageEntry(
+      chapter: chapter,
+      pageInChapter: pageInChapter,
+      pageCountInChapter: pageCountInChapter,
+      chapterTextStart: chapterTextStart,
+      chapterTextEnd: chapterTextEnd,
+      globalReadableOffset: globalReadableOffset ?? this.globalReadableOffset,
+      content: content,
+      showsTitle: showsTitle,
+    );
+  }
+}
+
+class _ReaderTextSlice {
+  const _ReaderTextSlice({required this.start, required this.end});
+
+  final int start;
+  final int end;
+}
+
+class _ReaderPageLayout {
+  const _ReaderPageLayout({
+    required this.contentWidth,
+    required this.firstPageBodyHeight,
+    required this.followingPageBodyHeight,
+  });
+
+  final double contentWidth;
+  final double firstPageBodyHeight;
+  final double followingPageBodyHeight;
+}
+
+class _ReaderLayoutSnapshot {
+  const _ReaderLayoutSnapshot({
+    required this.viewportSize,
+    required this.textScaler,
+  });
+
+  final Size viewportSize;
+  final TextScaler textScaler;
 }

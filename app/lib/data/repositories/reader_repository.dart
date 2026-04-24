@@ -37,6 +37,7 @@ class ReaderRepository {
         author: book.author,
         format: book.format,
         totalChapters: book.totalChapters,
+        coverImagePath: book.coverImagePath,
       ),
       chapters: chapters
           .map(

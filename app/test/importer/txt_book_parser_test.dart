@@ -47,6 +47,16 @@ void main() {
     expect(chapters[2].title, '第二章 继续');
   });
 
+  test('recognizes ending chapter title', () {
+    const String text = '第一章 开始\n正文1\n\n终章\n正文2';
+
+    final List<TxtChapter> chapters = splitter.split(text);
+
+    expect(chapters, hasLength(2));
+    expect(chapters[0].title, '第一章 开始');
+    expect(chapters[1].title, '终章');
+  });
+
   test('parses txt file end to end', () async {
     final Directory tempDir = await Directory.systemTemp.createTemp(
       'pocketread_txt_test',

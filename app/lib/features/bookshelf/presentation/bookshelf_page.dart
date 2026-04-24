@@ -1158,7 +1158,7 @@ class _BookCard extends StatelessWidget {
       color: Colors.transparent,
       child: InkWell(
         borderRadius: BorderRadius.circular(8),
-        onTap: onOpenDetail,
+        onTap: onContinueRead,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
@@ -1296,7 +1296,7 @@ class _BookListTile extends StatelessWidget {
       color: Colors.white,
       borderRadius: BorderRadius.circular(16),
       child: InkWell(
-        onTap: onOpenDetail,
+        onTap: onContinueRead,
         borderRadius: BorderRadius.circular(16),
         child: Container(
           padding: const EdgeInsets.all(14),

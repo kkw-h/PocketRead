@@ -25,6 +25,7 @@ void main() {
     expect(preferences.single.backgroundColor, '#F6F1E9');
     expect(preferences.single.fontSize, 18);
     expect(preferences.single.lineHeight, 1.6);
+    expect(preferences.single.leftTapAction, 'previous_page');
   });
 
   test(

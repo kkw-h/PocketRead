@@ -8,8 +8,10 @@ class BookFilePickerService implements BookFilePickerPort {
   @override
   Future<ImportSelection?> pickBookFiles() async {
     final FilePickerResult? result = await FilePicker.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: <String>['txt', 'epub'],
+      // Some Android file_picker backends do not implement the `custom`
+      // method channel. Pick any file and let the import pipeline reject
+      // unsupported formats instead of failing before the system picker opens.
+      type: FileType.any,
       allowMultiple: true,
       withData: false,
       lockParentWindow: true,
@@ -22,6 +24,7 @@ class BookFilePickerService implements BookFilePickerPort {
     final List<String> paths = result.files
         .map((PlatformFile file) => file.path)
         .whereType<String>()
+        .where(_isSupportedBookPath)
         .toList(growable: false);
     if (paths.isEmpty) {
       return null;
@@ -55,5 +58,10 @@ class BookFilePickerService implements BookFilePickerPort {
       return '已选择 1 本书';
     }
     return '已选择 $count 本书';
+  }
+
+  bool _isSupportedBookPath(String path) {
+    final String lowerPath = path.toLowerCase();
+    return lowerPath.endsWith('.txt') || lowerPath.endsWith('.epub');
   }
 }

@@ -75,6 +75,7 @@ class ReaderRepository {
       fontSize: preference.fontSize,
       lineHeight: preference.lineHeight,
       horizontalPadding: preference.horizontalPadding,
+      leftTapAction: _mapLeftTapAction(preference.leftTapAction),
     );
   }
 
@@ -93,6 +94,9 @@ class ReaderRepository {
             fontSize: Value<double>(settings.fontSize),
             lineHeight: Value<double>(settings.lineHeight),
             horizontalPadding: Value<double>(settings.horizontalPadding),
+            leftTapAction: Value<String>(
+              _storageLeftTapAction(settings.leftTapAction),
+            ),
             updatedAt: Value<int>(now),
           ),
         );
@@ -233,11 +237,27 @@ class ReaderRepository {
   String _storageFontFamily(String value) {
     return switch (value) {
       'system' => 'system',
-      'song' => 'serif',
-      'wenkai' => 'serif',
-      'sans' => 'sans-serif',
-      'mono' => 'monospace',
+      'song' => 'song',
+      'wenkai' => 'wenkai',
+      'sans' => 'sans',
+      'mono' => 'mono',
       _ => 'system',
+    };
+  }
+
+  String _mapLeftTapAction(String value) {
+    return switch (value) {
+      'next_page' => 'next_page',
+      'previous_page' => 'previous_page',
+      _ => 'previous_page',
+    };
+  }
+
+  String _storageLeftTapAction(String value) {
+    return switch (value) {
+      'next_page' => 'next_page',
+      'previous_page' => 'previous_page',
+      _ => 'previous_page',
     };
   }
 }

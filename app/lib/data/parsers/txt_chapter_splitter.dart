@@ -4,7 +4,7 @@ class TxtChapterSplitter {
   const TxtChapterSplitter();
 
   static final RegExp _chapterHeadingPattern = RegExp(
-    r'^\s*(第[一二三四五六七八九十百千万零〇两\d]+[章节卷集部篇回][^\n]{0,60}|序章|楔子|前言|后记|尾声)\s*$',
+    r'^\s*(第[一二三四五六七八九十百千万零〇两\d]+[章节卷集部篇回][^\n]{0,60}|序章|楔子|前言|后记|尾声|终章)\s*$',
     multiLine: true,
   );
 

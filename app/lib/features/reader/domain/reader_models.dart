@@ -94,6 +94,7 @@ class ReaderSettingsModel {
     required this.fontSize,
     required this.lineHeight,
     required this.horizontalPadding,
+    required this.leftTapAction,
   });
 
   factory ReaderSettingsModel.defaults() {
@@ -104,6 +105,7 @@ class ReaderSettingsModel {
       fontSize: 18,
       lineHeight: 1.78,
       horizontalPadding: 26,
+      leftTapAction: 'previous_page',
     );
   }
 
@@ -113,4 +115,5 @@ class ReaderSettingsModel {
   final double fontSize;
   final double lineHeight;
   final double horizontalPadding;
+  final String leftTapAction;
 }

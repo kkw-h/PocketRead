@@ -151,6 +151,9 @@ class ReaderPreferences extends Table {
 
   RealColumn get horizontalPadding => real().withDefault(const Constant(20))();
 
+  TextColumn get leftTapAction =>
+      text().withDefault(const Constant('previous_page'))();
+
   RealColumn get paragraphSpacing => real().withDefault(const Constant(12))();
 
   TextColumn get textAlign => text().withDefault(const Constant('left'))();
@@ -235,7 +238,7 @@ class AppDatabase extends _$AppDatabase {
       );
 
   @override
-  int get schemaVersion => 1;
+  int get schemaVersion => 2;
 
   @override
   MigrationStrategy get migration => MigrationStrategy(
@@ -248,6 +251,12 @@ class AppDatabase extends _$AppDatabase {
           updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
         ),
       );
+    },
+    onUpgrade: (Migrator migrator, int from, int to) async {
+      if (from < 2) {
+        await migrator.addColumn(readerPreferences, readerPreferences.leftTapAction);
+      }
+      await _createV1Indexes();
     },
     beforeOpen: (OpeningDetails details) async {
       await customStatement('PRAGMA foreign_keys = ON');

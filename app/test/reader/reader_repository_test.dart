@@ -123,6 +123,7 @@ void main() {
     expect(defaults.themeMode, 'system');
     expect(defaults.backgroundStyleId, 'paper');
     expect(defaults.fontFamilyId, 'system');
+    expect(defaults.leftTapAction, 'previous_page');
 
     await repository.saveReaderSettings(
       const ReaderSettingsModel(
@@ -132,6 +133,7 @@ void main() {
         fontSize: 22,
         lineHeight: 2,
         horizontalPadding: 38,
+        leftTapAction: 'next_page',
       ),
     );
 
@@ -143,6 +145,25 @@ void main() {
     expect(saved.fontSize, 22);
     expect(saved.lineHeight, 2);
     expect(saved.horizontalPadding, 38);
+    expect(saved.leftTapAction, 'next_page');
+  });
+
+  test('preserves selected built-in font family ids', () async {
+    await repository.saveReaderSettings(
+      const ReaderSettingsModel(
+        themeMode: 'system',
+        backgroundStyleId: 'paper',
+        fontFamilyId: 'wenkai',
+        fontSize: 18,
+        lineHeight: 1.7,
+        horizontalPadding: 32,
+        leftTapAction: 'previous_page',
+      ),
+    );
+
+    final ReaderSettingsModel saved = await repository.getReaderSettings();
+
+    expect(saved.fontFamilyId, 'wenkai');
   });
 }
 

@@ -3183,6 +3183,18 @@ class $ReaderPreferencesTable extends ReaderPreferences
         requiredDuringInsert: false,
         defaultValue: const Constant(20),
       );
+  static const VerificationMeta _leftTapActionMeta = const VerificationMeta(
+    'leftTapAction',
+  );
+  @override
+  late final GeneratedColumn<String> leftTapAction = GeneratedColumn<String>(
+    'left_tap_action',
+    aliasedName,
+    false,
+    type: DriftSqlType.string,
+    requiredDuringInsert: false,
+    defaultValue: const Constant('previous_page'),
+  );
   static const VerificationMeta _paragraphSpacingMeta = const VerificationMeta(
     'paragraphSpacing',
   );
@@ -3238,6 +3250,7 @@ class $ReaderPreferencesTable extends ReaderPreferences
     fontSize,
     lineHeight,
     horizontalPadding,
+    leftTapAction,
     paragraphSpacing,
     textAlign,
     brightnessLock,
@@ -3297,6 +3310,15 @@ class $ReaderPreferencesTable extends ReaderPreferences
         horizontalPadding.isAcceptableOrUnknown(
           data['horizontal_padding']!,
           _horizontalPaddingMeta,
+        ),
+      );
+    }
+    if (data.containsKey('left_tap_action')) {
+      context.handle(
+        _leftTapActionMeta,
+        leftTapAction.isAcceptableOrUnknown(
+          data['left_tap_action']!,
+          _leftTapActionMeta,
         ),
       );
     }
@@ -3369,6 +3391,10 @@ class $ReaderPreferencesTable extends ReaderPreferences
         DriftSqlType.double,
         data['${effectivePrefix}horizontal_padding'],
       )!,
+      leftTapAction: attachedDatabase.typeMapping.read(
+        DriftSqlType.string,
+        data['${effectivePrefix}left_tap_action'],
+      )!,
       paragraphSpacing: attachedDatabase.typeMapping.read(
         DriftSqlType.double,
         data['${effectivePrefix}paragraph_spacing'],
@@ -3403,6 +3429,7 @@ class ReaderPreference extends DataClass
   final double fontSize;
   final double lineHeight;
   final double horizontalPadding;
+  final String leftTapAction;
   final double paragraphSpacing;
   final String textAlign;
   final String? brightnessLock;
@@ -3415,6 +3442,7 @@ class ReaderPreference extends DataClass
     required this.fontSize,
     required this.lineHeight,
     required this.horizontalPadding,
+    required this.leftTapAction,
     required this.paragraphSpacing,
     required this.textAlign,
     this.brightnessLock,
@@ -3430,6 +3458,7 @@ class ReaderPreference extends DataClass
     map['font_size'] = Variable<double>(fontSize);
     map['line_height'] = Variable<double>(lineHeight);
     map['horizontal_padding'] = Variable<double>(horizontalPadding);
+    map['left_tap_action'] = Variable<String>(leftTapAction);
     map['paragraph_spacing'] = Variable<double>(paragraphSpacing);
     map['text_align'] = Variable<String>(textAlign);
     if (!nullToAbsent || brightnessLock != null) {
@@ -3448,6 +3477,7 @@ class ReaderPreference extends DataClass
       fontSize: Value(fontSize),
       lineHeight: Value(lineHeight),
       horizontalPadding: Value(horizontalPadding),
+      leftTapAction: Value(leftTapAction),
       paragraphSpacing: Value(paragraphSpacing),
       textAlign: Value(textAlign),
       brightnessLock: brightnessLock == null && nullToAbsent
@@ -3470,6 +3500,7 @@ class ReaderPreference extends DataClass
       fontSize: serializer.fromJson<double>(json['fontSize']),
       lineHeight: serializer.fromJson<double>(json['lineHeight']),
       horizontalPadding: serializer.fromJson<double>(json['horizontalPadding']),
+      leftTapAction: serializer.fromJson<String>(json['leftTapAction']),
       paragraphSpacing: serializer.fromJson<double>(json['paragraphSpacing']),
       textAlign: serializer.fromJson<String>(json['textAlign']),
       brightnessLock: serializer.fromJson<String?>(json['brightnessLock']),
@@ -3487,6 +3518,7 @@ class ReaderPreference extends DataClass
       'fontSize': serializer.toJson<double>(fontSize),
       'lineHeight': serializer.toJson<double>(lineHeight),
       'horizontalPadding': serializer.toJson<double>(horizontalPadding),
+      'leftTapAction': serializer.toJson<String>(leftTapAction),
       'paragraphSpacing': serializer.toJson<double>(paragraphSpacing),
       'textAlign': serializer.toJson<String>(textAlign),
       'brightnessLock': serializer.toJson<String?>(brightnessLock),
@@ -3502,6 +3534,7 @@ class ReaderPreference extends DataClass
     double? fontSize,
     double? lineHeight,
     double? horizontalPadding,
+    String? leftTapAction,
     double? paragraphSpacing,
     String? textAlign,
     Value<String?> brightnessLock = const Value.absent(),
@@ -3514,6 +3547,7 @@ class ReaderPreference extends DataClass
     fontSize: fontSize ?? this.fontSize,
     lineHeight: lineHeight ?? this.lineHeight,
     horizontalPadding: horizontalPadding ?? this.horizontalPadding,
+    leftTapAction: leftTapAction ?? this.leftTapAction,
     paragraphSpacing: paragraphSpacing ?? this.paragraphSpacing,
     textAlign: textAlign ?? this.textAlign,
     brightnessLock: brightnessLock.present
@@ -3538,6 +3572,9 @@ class ReaderPreference extends DataClass
       horizontalPadding: data.horizontalPadding.present
           ? data.horizontalPadding.value
           : this.horizontalPadding,
+      leftTapAction: data.leftTapAction.present
+          ? data.leftTapAction.value
+          : this.leftTapAction,
       paragraphSpacing: data.paragraphSpacing.present
           ? data.paragraphSpacing.value
           : this.paragraphSpacing,
@@ -3559,6 +3596,7 @@ class ReaderPreference extends DataClass
           ..write('fontSize: $fontSize, ')
           ..write('lineHeight: $lineHeight, ')
           ..write('horizontalPadding: $horizontalPadding, ')
+          ..write('leftTapAction: $leftTapAction, ')
           ..write('paragraphSpacing: $paragraphSpacing, ')
           ..write('textAlign: $textAlign, ')
           ..write('brightnessLock: $brightnessLock, ')
@@ -3576,6 +3614,7 @@ class ReaderPreference extends DataClass
     fontSize,
     lineHeight,
     horizontalPadding,
+    leftTapAction,
     paragraphSpacing,
     textAlign,
     brightnessLock,
@@ -3592,6 +3631,7 @@ class ReaderPreference extends DataClass
           other.fontSize == this.fontSize &&
           other.lineHeight == this.lineHeight &&
           other.horizontalPadding == this.horizontalPadding &&
+          other.leftTapAction == this.leftTapAction &&
           other.paragraphSpacing == this.paragraphSpacing &&
           other.textAlign == this.textAlign &&
           other.brightnessLock == this.brightnessLock &&
@@ -3606,6 +3646,7 @@ class ReaderPreferencesCompanion extends UpdateCompanion<ReaderPreference> {
   final Value<double> fontSize;
   final Value<double> lineHeight;
   final Value<double> horizontalPadding;
+  final Value<String> leftTapAction;
   final Value<double> paragraphSpacing;
   final Value<String> textAlign;
   final Value<String?> brightnessLock;
@@ -3618,6 +3659,7 @@ class ReaderPreferencesCompanion extends UpdateCompanion<ReaderPreference> {
     this.fontSize = const Value.absent(),
     this.lineHeight = const Value.absent(),
     this.horizontalPadding = const Value.absent(),
+    this.leftTapAction = const Value.absent(),
     this.paragraphSpacing = const Value.absent(),
     this.textAlign = const Value.absent(),
     this.brightnessLock = const Value.absent(),
@@ -3631,6 +3673,7 @@ class ReaderPreferencesCompanion extends UpdateCompanion<ReaderPreference> {
     this.fontSize = const Value.absent(),
     this.lineHeight = const Value.absent(),
     this.horizontalPadding = const Value.absent(),
+    this.leftTapAction = const Value.absent(),
     this.paragraphSpacing = const Value.absent(),
     this.textAlign = const Value.absent(),
     this.brightnessLock = const Value.absent(),
@@ -3644,6 +3687,7 @@ class ReaderPreferencesCompanion extends UpdateCompanion<ReaderPreference> {
     Expression<double>? fontSize,
     Expression<double>? lineHeight,
     Expression<double>? horizontalPadding,
+    Expression<String>? leftTapAction,
     Expression<double>? paragraphSpacing,
     Expression<String>? textAlign,
     Expression<String>? brightnessLock,
@@ -3657,6 +3701,7 @@ class ReaderPreferencesCompanion extends UpdateCompanion<ReaderPreference> {
       if (fontSize != null) 'font_size': fontSize,
       if (lineHeight != null) 'line_height': lineHeight,
       if (horizontalPadding != null) 'horizontal_padding': horizontalPadding,
+      if (leftTapAction != null) 'left_tap_action': leftTapAction,
       if (paragraphSpacing != null) 'paragraph_spacing': paragraphSpacing,
       if (textAlign != null) 'text_align': textAlign,
       if (brightnessLock != null) 'brightness_lock': brightnessLock,
@@ -3672,6 +3717,7 @@ class ReaderPreferencesCompanion extends UpdateCompanion<ReaderPreference> {
     Value<double>? fontSize,
     Value<double>? lineHeight,
     Value<double>? horizontalPadding,
+    Value<String>? leftTapAction,
     Value<double>? paragraphSpacing,
     Value<String>? textAlign,
     Value<String?>? brightnessLock,
@@ -3685,6 +3731,7 @@ class ReaderPreferencesCompanion extends UpdateCompanion<ReaderPreference> {
       fontSize: fontSize ?? this.fontSize,
       lineHeight: lineHeight ?? this.lineHeight,
       horizontalPadding: horizontalPadding ?? this.horizontalPadding,
+      leftTapAction: leftTapAction ?? this.leftTapAction,
       paragraphSpacing: paragraphSpacing ?? this.paragraphSpacing,
       textAlign: textAlign ?? this.textAlign,
       brightnessLock: brightnessLock ?? this.brightnessLock,
@@ -3716,6 +3763,9 @@ class ReaderPreferencesCompanion extends UpdateCompanion<ReaderPreference> {
     if (horizontalPadding.present) {
       map['horizontal_padding'] = Variable<double>(horizontalPadding.value);
     }
+    if (leftTapAction.present) {
+      map['left_tap_action'] = Variable<String>(leftTapAction.value);
+    }
     if (paragraphSpacing.present) {
       map['paragraph_spacing'] = Variable<double>(paragraphSpacing.value);
     }
@@ -3741,6 +3791,7 @@ class ReaderPreferencesCompanion extends UpdateCompanion<ReaderPreference> {
           ..write('fontSize: $fontSize, ')
           ..write('lineHeight: $lineHeight, ')
           ..write('horizontalPadding: $horizontalPadding, ')
+          ..write('leftTapAction: $leftTapAction, ')
           ..write('paragraphSpacing: $paragraphSpacing, ')
           ..write('textAlign: $textAlign, ')
           ..write('brightnessLock: $brightnessLock, ')
@@ -7158,6 +7209,7 @@ typedef $$ReaderPreferencesTableCreateCompanionBuilder =
       Value<double> fontSize,
       Value<double> lineHeight,
       Value<double> horizontalPadding,
+      Value<String> leftTapAction,
       Value<double> paragraphSpacing,
       Value<String> textAlign,
       Value<String?> brightnessLock,
@@ -7172,6 +7224,7 @@ typedef $$ReaderPreferencesTableUpdateCompanionBuilder =
       Value<double> fontSize,
       Value<double> lineHeight,
       Value<double> horizontalPadding,
+      Value<String> leftTapAction,
       Value<double> paragraphSpacing,
       Value<String> textAlign,
       Value<String?> brightnessLock,
@@ -7219,6 +7272,11 @@ class $$ReaderPreferencesTableFilterComposer
 
   ColumnFilters<double> get horizontalPadding => $composableBuilder(
     column: $table.horizontalPadding,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<String> get leftTapAction => $composableBuilder(
+    column: $table.leftTapAction,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -7287,6 +7345,11 @@ class $$ReaderPreferencesTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<String> get leftTapAction => $composableBuilder(
+    column: $table.leftTapAction,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<double> get paragraphSpacing => $composableBuilder(
     column: $table.paragraphSpacing,
     builder: (column) => ColumnOrderings(column),
@@ -7343,6 +7406,11 @@ class $$ReaderPreferencesTableAnnotationComposer
 
   GeneratedColumn<double> get horizontalPadding => $composableBuilder(
     column: $table.horizontalPadding,
+    builder: (column) => column,
+  );
+
+  GeneratedColumn<String> get leftTapAction => $composableBuilder(
+    column: $table.leftTapAction,
     builder: (column) => column,
   );
 
@@ -7410,6 +7478,7 @@ class $$ReaderPreferencesTableTableManager
                 Value<double> fontSize = const Value.absent(),
                 Value<double> lineHeight = const Value.absent(),
                 Value<double> horizontalPadding = const Value.absent(),
+                Value<String> leftTapAction = const Value.absent(),
                 Value<double> paragraphSpacing = const Value.absent(),
                 Value<String> textAlign = const Value.absent(),
                 Value<String?> brightnessLock = const Value.absent(),
@@ -7422,6 +7491,7 @@ class $$ReaderPreferencesTableTableManager
                 fontSize: fontSize,
                 lineHeight: lineHeight,
                 horizontalPadding: horizontalPadding,
+                leftTapAction: leftTapAction,
                 paragraphSpacing: paragraphSpacing,
                 textAlign: textAlign,
                 brightnessLock: brightnessLock,
@@ -7436,6 +7506,7 @@ class $$ReaderPreferencesTableTableManager
                 Value<double> fontSize = const Value.absent(),
                 Value<double> lineHeight = const Value.absent(),
                 Value<double> horizontalPadding = const Value.absent(),
+                Value<String> leftTapAction = const Value.absent(),
                 Value<double> paragraphSpacing = const Value.absent(),
                 Value<String> textAlign = const Value.absent(),
                 Value<String?> brightnessLock = const Value.absent(),
@@ -7448,6 +7519,7 @@ class $$ReaderPreferencesTableTableManager
                 fontSize: fontSize,
                 lineHeight: lineHeight,
                 horizontalPadding: horizontalPadding,
+                leftTapAction: leftTapAction,
                 paragraphSpacing: paragraphSpacing,
                 textAlign: textAlign,
                 brightnessLock: brightnessLock,

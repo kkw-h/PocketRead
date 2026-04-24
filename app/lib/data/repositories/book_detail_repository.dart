@@ -10,25 +10,58 @@ class BookDetailRepository {
   final DateFormat _dateFormat = DateFormat('yyyy/MM/dd HH:mm');
 
   Future<BookDetailModel?> getBookDetail(String bookId) async {
-    final Book? book =
-        await (_database.select(_database.books)..where((Books table) {
-              return table.id.equals(bookId) & table.deletedAt.isNull();
-            }))
-            .getSingleOrNull();
-    if (book == null) {
+    final QueryRow? row = await _database
+        .customSelect(
+          '''
+          SELECT
+            b.id,
+            b.title,
+            b.author,
+            b.format,
+            b.source_file_path,
+            b.local_file_path,
+            b.file_name,
+            b.file_size,
+            b.file_hash,
+            b.cover_image_path,
+            b.cover_source_type,
+            b.charset_name,
+            b.language,
+            b.total_chapters,
+            b.total_words,
+            b.is_favorite,
+            b.pinned_at,
+            b.import_status,
+            b.created_at,
+            b.updated_at,
+            b.last_read_at,
+            b.description,
+            p.current_chapter_index,
+            p.progress_percent
+          FROM books b
+          LEFT JOIN reading_progress p ON p.book_id = b.id
+          WHERE b.id = ? AND b.deleted_at IS NULL
+          LIMIT 1
+          ''',
+          variables: <Variable<Object>>[Variable<String>(bookId)],
+          readsFrom: <ResultSetImplementation<Table, Object?>>{
+            _database.books,
+            _database.readingProgress,
+          },
+        )
+        .getSingleOrNull();
+    if (row == null) {
       return null;
     }
 
-    final ReadingProgressData? progress =
-        await (_database.select(_database.readingProgress)
-              ..where((ReadingProgress table) => table.bookId.equals(bookId)))
-            .getSingleOrNull();
-    final BookChapter? currentChapter = progress == null
+    final double progressPercent = row.readNullable<double>('progress_percent') ?? 0;
+    final int? currentChapterIndex = row.readNullable<int>('current_chapter_index');
+    final BookChapter? currentChapter = currentChapterIndex == null
         ? null
         : await (_database.select(_database.bookChapters)
                 ..where((BookChapters table) {
                   return table.bookId.equals(bookId) &
-                      table.chapterIndex.equals(progress.currentChapterIndex);
+                      table.chapterIndex.equals(currentChapterIndex);
                 }))
               .getSingleOrNull();
     final ImportRecord? importRecord =
@@ -42,40 +75,40 @@ class BookDetailRepository {
               ..limit(1))
             .getSingleOrNull();
 
-    final String progressLabel = progress == null
+    final String progressLabel = progressPercent <= 0
         ? '未读'
-        : '已读 ${(progress.progressPercent * 100).round()}%';
+        : '已读 ${(progressPercent * 100).round()}%';
 
     return BookDetailModel(
-      id: book.id,
-      title: book.title,
-      author: book.author,
-      format: book.format.toUpperCase(),
-      sourceFilePath: book.sourceFilePath,
-      localFilePath: book.localFilePath,
-      fileName: book.fileName,
-      fileSizeLabel: _formatFileSize(book.fileSize),
-      fileHash: book.fileHash,
-      coverImagePath: book.coverImagePath,
-      coverSourceType: book.coverSourceType,
-      charsetName: book.charsetName,
-      language: book.language,
-      totalChapters: book.totalChapters,
-      totalWords: book.totalWords,
-      isFavorite: book.isFavorite,
-      isPinned: book.pinnedAt != null,
-      importStatus: book.importStatus,
-      createdAtLabel: _formatMillis(book.createdAt),
-      updatedAtLabel: _formatMillis(book.updatedAt),
-      lastReadAtLabel: _formatNullableMillis(book.lastReadAt),
-      progressPercent: progress?.progressPercent ?? 0,
+      id: row.read<String>('id'),
+      title: row.read<String>('title'),
+      author: row.read<String>('author'),
+      format: row.read<String>('format').toUpperCase(),
+      sourceFilePath: row.read<String>('source_file_path'),
+      localFilePath: row.read<String>('local_file_path'),
+      fileName: row.read<String>('file_name'),
+      fileSizeLabel: _formatFileSize(row.read<int>('file_size')),
+      fileHash: row.read<String>('file_hash'),
+      coverImagePath: row.readNullable<String>('cover_image_path'),
+      coverSourceType: row.readNullable<String>('cover_source_type'),
+      charsetName: row.readNullable<String>('charset_name'),
+      language: row.readNullable<String>('language'),
+      totalChapters: row.read<int>('total_chapters'),
+      totalWords: row.readNullable<int>('total_words'),
+      isFavorite: row.read<bool>('is_favorite'),
+      isPinned: row.readNullable<int>('pinned_at') != null,
+      importStatus: row.read<String>('import_status'),
+      createdAtLabel: _formatMillis(row.read<int>('created_at')),
+      updatedAtLabel: _formatMillis(row.read<int>('updated_at')),
+      lastReadAtLabel: _formatNullableMillis(row.readNullable<int>('last_read_at')),
+      progressPercent: progressPercent,
       progressLabel: progressLabel,
       lastReadChapterLabel: currentChapter?.title,
       importRecordLabel: importRecord == null
           ? '暂无导入记录'
           : '${importRecord.result} · ${_formatMillis(importRecord.createdAt)}',
-      description: book.description?.trim().isNotEmpty == true
-          ? book.description
+      description: row.readNullable<String>('description')?.trim().isNotEmpty == true
+          ? row.readNullable<String>('description')
           : null,
     );
   }

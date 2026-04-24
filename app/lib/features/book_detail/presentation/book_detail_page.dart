@@ -9,6 +9,7 @@ import 'package:pocketread/core/widgets/ux_state_view.dart';
 import 'package:pocketread/features/book_detail/application/book_detail_providers.dart';
 import 'package:pocketread/features/book_detail/domain/book_detail_model.dart';
 import 'package:pocketread/features/bookshelf/application/bookshelf_providers.dart';
+import 'package:pocketread/features/bookshelf/domain/bookshelf_book.dart';
 import 'package:pocketread/features/reader/application/reader_providers.dart';
 
 class BookDetailPage extends ConsumerWidget {
@@ -31,6 +32,9 @@ class BookDetailPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final AsyncValue<BookDetailModel?> detail = ref.watch(
       bookDetailProvider(bookId),
+    );
+    final AsyncValue<List<BookshelfBook>> bookshelfBooks = ref.watch(
+      bookshelfBooksProvider,
     );
 
     return Scaffold(
@@ -83,6 +87,14 @@ class BookDetailPage extends ConsumerWidget {
                 outlineColor: _line,
               );
             }
+            final List<BookshelfBook>? bookshelfBookList =
+                bookshelfBooks.asData?.value;
+            final BookshelfBook? shelfBook = bookshelfBookList
+                ?.cast<BookshelfBook?>()
+                .firstWhere(
+                  (BookshelfBook? book) => book?.id == data.id,
+                  orElse: () => null,
+                );
             return SingleChildScrollView(
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
               child: Column(
@@ -95,7 +107,10 @@ class BookDetailPage extends ConsumerWidget {
                   const SizedBox(height: 18),
                   _HeroSection(data: data),
                   const SizedBox(height: 16),
-                  _StatsCard(data: data),
+                  _StatsCard(
+                    data: data,
+                    progressPercentOverride: shelfBook?.progressPercent,
+                  ),
                   const SizedBox(height: 16),
                   _ContinueButton(
                     data: data,
@@ -183,10 +198,12 @@ class BookDetailPage extends ConsumerWidget {
     if (!context.mounted) {
       return;
     }
-    context.pushNamed(
+    await context.pushNamed(
       AppRoute.reader.name,
       pathParameters: <String, String>{'bookId': bookId},
     );
+    ref.invalidate(bookDetailProvider(bookId));
+    ref.invalidate(bookshelfBooksProvider);
   }
 
   Future<void> _toggleFavorite(WidgetRef ref, BookDetailModel data) async {
@@ -524,13 +541,21 @@ class _GeneratedCover extends StatelessWidget {
 }
 
 class _StatsCard extends StatelessWidget {
-  const _StatsCard({required this.data});
+  const _StatsCard({
+    required this.data,
+    this.progressPercentOverride,
+  });
 
   final BookDetailModel data;
+  final double? progressPercentOverride;
 
   @override
   Widget build(BuildContext context) {
-    final int percent = (data.progressPercent * 100).round();
+    final double effectiveProgress = progressPercentOverride ?? data.progressPercent;
+    final int percent = (effectiveProgress * 100).round();
+    final String progressLabel = effectiveProgress <= 0
+        ? '未读'
+        : '已读 $percent%';
     return Container(
       decoration: BoxDecoration(
         color: BookDetailPage._cardBackground,
@@ -550,8 +575,8 @@ class _StatsCard extends StatelessWidget {
             child: _StatItem(
               title: '阅读进度',
               value: '$percent%',
-              footer: data.progressLabel,
-              progress: data.progressPercent,
+              footer: progressLabel,
+              progress: effectiveProgress,
               showProgressBar: true,
             ),
           ),

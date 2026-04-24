@@ -1,15 +1,25 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:pocketread/core/widgets/ux_state_view.dart';
 import 'package:pocketread/data/repositories/reader_repository.dart';
 import 'package:pocketread/features/reader/application/reader_launch_warmup_service.dart';
 import 'package:pocketread/features/reader/application/reader_providers.dart';
 import 'package:pocketread/features/reader/domain/reader_models.dart';
+
+part 'reader_pagination_engine.dart';
+part 'reader_pagination_disk_cache.dart';
+part 'reader_performance_log.dart';
 
 const double _readerPageTopPadding = 44;
 const double _readerPageBottomPadding = 48;
@@ -34,25 +44,32 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
   static const Color _accent = Color(0xFF2E9D62);
   static const Color _overlaySurface = Color(0xFFFFFCF7);
   static const Color _overlayChipSurface = Color(0xFFF7F3EC);
-  static const int _maxChapterPaginationCacheEntries = 24;
-  static final Map<String, List<_ReaderPageEntry>> _chapterPaginationCache =
-      <String, List<_ReaderPageEntry>>{};
+  static const int _readerWindowLookAheadChapters = 2;
 
-  final PageController _pageController = PageController();
+  PageController _pageController = PageController(keepPage: false);
+  int _pageControllerRevision = 0;
 
   late final ReaderRepository _readerRepository;
   ReaderBookDetail? _detail;
   List<_ReaderPageEntry> _pages = const <_ReaderPageEntry>[];
   _ReaderUiSettings _settings = _ReaderUiSettings.defaults();
   int _globalPageIndex = 0;
+  final ValueNotifier<int> _visiblePageIndexNotifier = ValueNotifier<int>(0);
   bool _chromeVisible = false;
+  _ReaderBottomPanelTab _bottomPanelTab = _ReaderBottomPanelTab.menu;
+  bool _tocVisible = false;
   bool _loading = true;
+  bool _preserveChromeOnNextPageChange = false;
   String? _errorMessage;
   String? _paginationSignature;
   _ReaderPageEntry? _paginationAnchor;
   _ReaderLayoutSnapshot? _layoutSnapshot;
+  int _totalReadableLengthCache = 0;
   final Set<String> _queuedPrepaginationKeys = <String>{};
+  int _prepaginationRevision = 0;
   Timer? _saveDebounce;
+  Timer? _pageWindowSyncDebounce;
+  Timer? _prepaginationDebounce;
   Timer? _settingsSaveDebounce;
   DateTime _openedAt = DateTime.now();
 
@@ -61,6 +78,7 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     super.initState();
     _readerRepository = ref.read(readerRepositoryProvider);
     WidgetsBinding.instance.addObserver(this);
+    unawaited(_ReaderPaginationDiskCache.initialize(widget.bookId));
     _loadReader();
   }
 
@@ -68,9 +86,12 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _saveDebounce?.cancel();
+    _pageWindowSyncDebounce?.cancel();
+    _prepaginationDebounce?.cancel();
     _settingsSaveDebounce?.cancel();
-    unawaited(_readerRepository.saveReaderSettings(_settings.toModel()));
-    _saveProgress();
+    unawaited(_persistSettingsOnDispose());
+    unawaited(_saveProgressSafely());
+    _visiblePageIndexNotifier.dispose();
     _pageController.dispose();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
@@ -119,6 +140,7 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
       final _ReaderUiSettings loadedSettings = _ReaderUiSettings.fromModel(
         savedSettings,
       );
+      final int totalReadableLength = _calculateTotalReadableLength(detail);
       final ReaderLaunchWarmupService warmupService = ref.read(
         readerLaunchWarmupServiceProvider,
       );
@@ -131,17 +153,25 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
                 textScaler: _layoutSnapshot!.textScaler,
                 bookId: detail.book.id,
                 chapterCount: detail.chapters.length,
-                totalReadableLength: _totalReadableLength(detail),
+                totalReadableLength: totalReadableLength,
                 settings: savedSettings,
               ),
             );
+      final List<_ReaderPageEntry> preparedPages = preparedLaunch == null
+          ? const <_ReaderPageEntry>[]
+          : _pageEntriesFromWarmup(detail, preparedLaunch);
+      final int preparedPageIndex = (preparedLaunch?.initialPageIndex ?? 0)
+          .clamp(0, math.max(0, preparedPages.length - 1));
+      if (preparedPages.isNotEmpty) {
+        _replacePageController(initialPage: preparedPageIndex);
+      }
+
       setState(() {
         _settings = loadedSettings;
         _detail = detail;
-        _pages = preparedLaunch == null
-            ? const <_ReaderPageEntry>[]
-            : _pageEntriesFromWarmup(detail, preparedLaunch);
-        _globalPageIndex = preparedLaunch?.initialPageIndex ?? 0;
+        _totalReadableLengthCache = totalReadableLength;
+        _pages = preparedPages;
+        _setGlobalPageIndex(preparedPageIndex);
         _paginationSignature = preparedLaunch?.signature;
         _loading = false;
       });
@@ -163,158 +193,14 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     TextScaler textScaler,
     BuildContext context,
   ) {
-    final String text = _readableText(chapter).trim();
-    if (text.isEmpty) {
-      return <_ReaderPageEntry>[
-        _ReaderPageEntry(
-          chapter: chapter,
-          pageInChapter: 0,
-          pageCountInChapter: 1,
-          chapterTextStart: 0,
-          chapterTextEnd: 6,
-          globalReadableOffset: 0,
-          content: '本章暂无正文内容',
-          showsTitle: true,
-        ),
-      ];
-    }
-
-    final _ReaderPageLayout layout = _pageLayoutFor(
-      settings,
-      viewportSize,
-      context,
-    );
-    final TextStyle bodyStyle = _bodyTextStyle(settings, context);
-    final List<_ReaderTextSlice> slices = <_ReaderTextSlice>[];
-    int start = 0;
-    bool firstPage = true;
-
-    while (start < text.length) {
-      final double availableHeight = firstPage
-          ? layout.firstPageBodyHeight
-          : layout.followingPageBodyHeight;
-      final int end = _findPageEnd(
-        text: text,
-        start: start,
-        maxWidth: layout.contentWidth,
-        maxHeight: availableHeight,
-        style: bodyStyle,
-        textScaler: textScaler,
-      );
-      slices.add(_ReaderTextSlice(start: start, end: end));
-      start = _skipLeadingBreaks(text, end);
-      firstPage = false;
-    }
-
-    final int pageCount = math.max(1, slices.length);
-    return List<_ReaderPageEntry>.generate(pageCount, (int index) {
-      final _ReaderTextSlice slice = slices[index];
-      return _ReaderPageEntry(
-        chapter: chapter,
-        pageInChapter: index,
-        pageCountInChapter: pageCount,
-        chapterTextStart: slice.start,
-        chapterTextEnd: slice.end,
-        globalReadableOffset: _readableOffsetBeforeChapter(
-          chapter.chapterIndex,
-        ),
-        content: text.substring(slice.start, slice.end),
-        showsTitle: index == 0,
-      );
-    }, growable: false);
-  }
-
-  int _findPageEnd({
-    required String text,
-    required int start,
-    required double maxWidth,
-    required double maxHeight,
-    required TextStyle style,
-    required TextScaler textScaler,
-  }) {
-    int low = start + 1;
-    int high = text.length;
-    int best = low;
-    while (low <= high) {
-      final int middle = low + ((high - low) >> 1);
-      if (_fitsPage(
-        text.substring(start, middle),
-        maxWidth,
-        maxHeight,
-        style,
-        textScaler,
-      )) {
-        best = middle;
-        low = middle + 1;
-      } else {
-        high = middle - 1;
-      }
-    }
-
-    if (best >= text.length) {
-      return text.length;
-    }
-
-    final int softBreak = _lastSoftBreak(text, start, best);
-    if (softBreak > start) {
-      return softBreak;
-    }
-    return best;
-  }
-
-  bool _fitsPage(
-    String value,
-    double maxWidth,
-    double maxHeight,
-    TextStyle style,
-    TextScaler textScaler,
-  ) {
-    final TextPainter painter = TextPainter(
-      text: TextSpan(text: _displayText(value), style: style),
-      textAlign: TextAlign.justify,
-      textDirection: TextDirection.ltr,
+    return _ReaderPaginationEngine.buildChapterPages(
+      chapter: chapter,
+      text: _readableText(chapter),
+      globalReadableOffset: _readableOffsetBeforeChapter(chapter.chapterIndex),
+      layout: _pageLayoutFor(settings, viewportSize, context),
+      bodyStyle: _bodyTextStyle(settings, context),
       textScaler: textScaler,
-    )..layout(maxWidth: maxWidth);
-    return painter.height <= maxHeight;
-  }
-
-  String _displayText(String value) {
-    final List<String> lines = value
-        .split('\n')
-        .map((String item) => item.trimRight())
-        .where((String item) => item.isNotEmpty)
-        .toList(growable: false);
-    if (lines.isEmpty) {
-      return value;
-    }
-    return lines.join('\n');
-  }
-
-  int _lastSoftBreak(String text, int start, int best) {
-    final int lowerBound = math.max(start, best - 80);
-    for (int index = best; index > lowerBound; index -= 1) {
-      final String char = text[index - 1];
-      if (char == '\n' ||
-          char == '。' ||
-          char == '！' ||
-          char == '？' ||
-          char == '；' ||
-          char == '，' ||
-          char == '、' ||
-          char == ' ' ||
-          char == '.') {
-        return index;
-      }
-    }
-    return best;
-  }
-
-  int _skipLeadingBreaks(String text, int offset) {
-    int next = offset;
-    while (next < text.length && text.codeUnitAt(next) <= 32) {
-      next += 1;
-    }
-    return next;
+    );
   }
 
   int _restoreChapterIndex(ReaderProgressModel? progress) {
@@ -369,26 +255,11 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     int chapterIndex,
     int chapterOffset,
   ) {
-    final int index = pages.indexWhere((_ReaderPageEntry entry) {
-      return entry.chapter.chapterIndex == chapterIndex &&
-          chapterOffset >= entry.chapterTextStart &&
-          chapterOffset < entry.chapterTextEnd;
-    });
-    if (index >= 0) {
-      return index;
-    }
-    final int firstIndex = pages.indexWhere(
-      (_ReaderPageEntry entry) => entry.chapter.chapterIndex == chapterIndex,
+    return _ReaderPaginationEngine.pageIndexForChapterOffset(
+      pages,
+      chapterIndex,
+      chapterOffset,
     );
-    if (firstIndex < 0) {
-      return -1;
-    }
-    final int lastIndex = pages.lastIndexWhere(
-      (_ReaderPageEntry entry) => entry.chapter.chapterIndex == chapterIndex,
-    );
-    return chapterOffset <= pages[firstIndex].chapterTextStart
-        ? firstIndex
-        : lastIndex;
   }
 
   ReaderChapterModel? _chapterByIndex(int chapterIndex) {
@@ -405,15 +276,110 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
   }
 
   void _onPageChanged(int index) {
-    _globalPageIndex = index;
-    _saveDebounce?.cancel();
-    _saveDebounce = Timer(const Duration(milliseconds: 700), _saveProgress);
-    _prepaginateAroundCurrentPage();
-    if (mounted) {
+    if (!mounted) {
+      _globalPageIndex = index;
+      return;
+    }
+    _setGlobalPageIndex(index);
+    if (_chromeVisible || _preserveChromeOnNextPageChange) {
       setState(() {
-        _chromeVisible = false;
+        if (_preserveChromeOnNextPageChange) {
+          _preserveChromeOnNextPageChange = false;
+        } else {
+          _chromeVisible = false;
+        }
       });
     }
+    _saveDebounce?.cancel();
+    _saveDebounce = Timer(const Duration(milliseconds: 700), _saveProgress);
+    _schedulePageWindowSync();
+    _schedulePrepaginationAroundCurrentPage();
+  }
+
+  void _setGlobalPageIndex(int index) {
+    _globalPageIndex = index;
+    if (_visiblePageIndexNotifier.value != index) {
+      _visiblePageIndexNotifier.value = index;
+    }
+  }
+
+  void _schedulePageWindowSync() {
+    _pageWindowSyncDebounce?.cancel();
+    _pageWindowSyncDebounce = Timer(
+      const Duration(milliseconds: 180),
+      _syncPageWindowWhenIdle,
+    );
+  }
+
+  void _syncPageWindowWhenIdle() {
+    if (!mounted) {
+      return;
+    }
+    if (_pageController.hasClients &&
+        _pageController.position.isScrollingNotifier.value) {
+      _pageWindowSyncDebounce = Timer(
+        const Duration(milliseconds: 80),
+        _syncPageWindowWhenIdle,
+      );
+      return;
+    }
+    _syncPageWindowToCurrentChapter();
+  }
+
+  void _syncPageWindowToCurrentChapter() {
+    final ReaderBookDetail? detail = _detail;
+    final String? signature = _paginationSignature;
+    final _ReaderLayoutSnapshot? snapshot = _layoutSnapshot;
+    if (detail == null ||
+        signature == null ||
+        snapshot == null ||
+        _pages.isEmpty) {
+      return;
+    }
+
+    final _ReaderPageEntry currentEntry =
+        _pages[_globalPageIndex.clamp(0, math.max(0, _pages.length - 1))];
+    final List<int> missingChapterIndices =
+        _ReaderPaginationEngine.missingWindowChapterIndices(
+          detail: detail,
+          currentPages: _pages,
+          centerChapterIndex: currentEntry.chapter.chapterIndex,
+          lookAheadChapters: _readerWindowLookAheadChapters,
+        );
+    if (missingChapterIndices.isEmpty) {
+      return;
+    }
+
+    final int lastCurrentChapterIndex = _pages.last.chapter.chapterIndex;
+    final List<_ReaderPageEntry> appendPages = <_ReaderPageEntry>[];
+    for (final int chapterIndex in missingChapterIndices) {
+      if (chapterIndex <= lastCurrentChapterIndex) {
+        continue;
+      }
+      final ReaderChapterModel? chapter = _chapterByIndex(chapterIndex);
+      if (chapter == null) {
+        continue;
+      }
+      final List<_ReaderPageEntry> chapterPages = _chapterPagesFor(
+        chapter: chapter,
+        signature: signature,
+        settings: _settings,
+        viewportSize: snapshot.viewportSize,
+        textScaler: snapshot.textScaler,
+        context: context,
+      );
+      appendPages.addAll(chapterPages);
+    }
+    if (appendPages.isEmpty) {
+      return;
+    }
+    final int previousPageIndex = _globalPageIndex;
+    setState(() {
+      _pages = <_ReaderPageEntry>[..._pages, ...appendPages];
+      _setGlobalPageIndex(
+        previousPageIndex.clamp(0, math.max(0, _pages.length - 1)),
+      );
+    });
   }
 
   Future<void> _saveProgress() async {
@@ -425,12 +391,10 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     final _ReaderPageEntry entry =
         _pages[_globalPageIndex.clamp(0, math.max(0, _pages.length - 1))];
     final ReaderChapterModel chapter = entry.chapter;
-    final int globalOffset =
-        entry.globalReadableOffset + entry.chapterTextStart;
-    final int totalReadableLength = _totalReadableLength(detail);
-    final double progressPercent = totalReadableLength <= 0
-        ? 0
-        : (globalOffset / totalReadableLength).clamp(0, 1);
+    final double progressPercent = _progressPercentForEntry(
+      entry,
+      _totalReadableLengthCache,
+    );
     final int now = DateTime.now().millisecondsSinceEpoch;
     final int totalMinutes =
         (detail.progress?.totalReadingMinutes ?? 0) +
@@ -451,7 +415,22 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     _openedAt = DateTime.now();
   }
 
-  int _totalReadableLength(ReaderBookDetail detail) {
+  double _progressPercentForEntry(
+    _ReaderPageEntry entry,
+    int totalReadableLength,
+  ) {
+    if (totalReadableLength <= 0) {
+      return 0;
+    }
+    final int chapterProgressOffset = math.max(
+      entry.chapterTextStart + 1,
+      entry.chapterTextEnd,
+    );
+    final int globalOffset = entry.globalReadableOffset + chapterProgressOffset;
+    return (globalOffset / totalReadableLength).clamp(0, 1);
+  }
+
+  int _calculateTotalReadableLength(ReaderBookDetail detail) {
     int total = 0;
     for (final ReaderChapterModel chapter in detail.chapters) {
       total += _readableText(chapter).trim().length;
@@ -486,14 +465,110 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
   }
 
   Future<void> _goToChapter(int chapterIndex) async {
-    await _saveProgress();
+    unawaited(_saveProgressSafely());
+    _pageWindowSyncDebounce?.cancel();
     final ReaderChapterModel? chapter = _chapterByIndex(chapterIndex);
     if (chapter == null) {
+      return;
+    }
+    if (_jumpToChapterFromCurrentLayout(chapterIndex)) {
       return;
     }
     _paginationAnchor = _ReaderPageEntry.anchor(chapter: chapter);
     _paginationSignature = null;
     _ensurePaginationFromLastLayout();
+  }
+
+  void _replacePageController({
+    required int initialPage,
+    int? animateToPage,
+    Duration duration = const Duration(milliseconds: 220),
+    Curve curve = Curves.easeOutCubic,
+  }) {
+    final PageController previousController = _pageController;
+    final PageController nextController = PageController(
+      initialPage: initialPage,
+      keepPage: false,
+    );
+    _pageController = nextController;
+    _pageControllerRevision += 1;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      previousController.dispose();
+      if (!mounted ||
+          !identical(_pageController, nextController) ||
+          !nextController.hasClients) {
+        return;
+      }
+      if (animateToPage != null && animateToPage != initialPage) {
+        nextController.animateToPage(
+          animateToPage,
+          duration: duration,
+          curve: curve,
+        );
+      }
+    });
+  }
+
+  bool _jumpToChapterFromCurrentLayout(int chapterIndex) {
+    final ReaderBookDetail? detail = _detail;
+    final String? signature = _paginationSignature;
+    final _ReaderLayoutSnapshot? snapshot = _layoutSnapshot;
+    if (detail == null || signature == null || snapshot == null) {
+      return false;
+    }
+
+    final Stopwatch jumpStopwatch = Stopwatch()..start();
+    final List<_ReaderPageEntry> nextPages = _composeFocusedChapterWindow(
+      detail: detail,
+      chapterIndex: chapterIndex,
+      signature: signature,
+      settings: _settings,
+      viewportSize: snapshot.viewportSize,
+      textScaler: snapshot.textScaler,
+      context: context,
+    );
+    if (nextPages.isEmpty) {
+      _ReaderPerformanceLog.log(
+        'toc_jump_empty',
+        fields: <String, Object?>{'chapterIndex': chapterIndex},
+      );
+      return false;
+    }
+
+    final int nextIndex = _pageIndexForChapterOffset(
+      nextPages,
+      chapterIndex,
+      0,
+    ).clamp(0, math.max(0, nextPages.length - 1));
+
+    setState(() {
+      _invalidatePrepaginationQueue();
+      _replacePageController(initialPage: nextIndex);
+      _pages = nextPages;
+      _setGlobalPageIndex(nextIndex);
+      _paginationAnchor = null;
+      _tocVisible = false;
+      _chromeVisible = false;
+      _bottomPanelTab = _ReaderBottomPanelTab.menu;
+    });
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || nextPages.isEmpty) {
+        return;
+      }
+      _schedulePrepaginationAroundCurrentPage();
+    });
+    _ReaderPerformanceLog.log(
+      'toc_jump',
+      fields: <String, Object?>{
+        'chapterIndex': chapterIndex,
+        'pageIndex': nextIndex,
+        'windowPages': nextPages.length,
+        'durationMs': jumpStopwatch.elapsedMilliseconds,
+        'mode': 'focused',
+      },
+    );
+    return true;
   }
 
   void _handleTapUp(TapUpDetails details, BuildContext context) {
@@ -502,7 +577,7 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     final double leftBound = width * 0.33;
     final double rightBound = width * 0.67;
     if (dx < leftBound) {
-      _goToAdjacentPage(-1);
+      _goToAdjacentPage(_settings.leftTapAction == 'next_page' ? 1 : -1);
       return;
     }
     if (dx > rightBound) {
@@ -511,6 +586,9 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     }
     setState(() {
       _chromeVisible = !_chromeVisible;
+      if (_chromeVisible) {
+        _bottomPanelTab = _ReaderBottomPanelTab.menu;
+      }
     });
   }
 
@@ -528,7 +606,8 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     }
     setState(() {
       _chromeVisible = false;
-      _globalPageIndex = targetIndex;
+      _bottomPanelTab = _ReaderBottomPanelTab.menu;
+      _setGlobalPageIndex(targetIndex);
     });
     if (_pageController.hasClients) {
       _pageController.animateToPage(
@@ -537,7 +616,7 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
         curve: Curves.easeOutCubic,
       );
     }
-    _prepaginateAroundCurrentPage();
+    _schedulePrepaginationAroundCurrentPage();
   }
 
   bool _goToAdjacentChapter(int delta) {
@@ -557,9 +636,11 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
         targetChapterIndex >= detail.chapters.length) {
       return false;
     }
-    final List<_ReaderPageEntry> nextPages = _composeChapterWindow(
+    final Stopwatch chapterSwitchStopwatch = Stopwatch()..start();
+    final List<_ReaderPageEntry> nextPages = _composeChapterTransitionWindow(
       detail: detail,
-      centerChapterIndex: targetChapterIndex,
+      fromChapterIndex: currentEntry.chapter.chapterIndex,
+      targetChapterIndex: targetChapterIndex,
       signature: signature,
       settings: _settings,
       viewportSize: snapshot.viewportSize,
@@ -578,21 +659,32 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
       currentEntry.chapterTextStart,
     ).clamp(0, math.max(0, nextPages.length - 1));
     setState(() {
+      _invalidatePrepaginationQueue();
+      _replacePageController(
+        initialPage: currentIndexInNextPages,
+        animateToPage: nextIndex,
+      );
       _pages = nextPages;
-      _globalPageIndex = currentIndexInNextPages;
+      _setGlobalPageIndex(currentIndexInNextPages);
       _chromeVisible = false;
+      _bottomPanelTab = _ReaderBottomPanelTab.menu;
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_pageController.hasClients && nextPages.isNotEmpty) {
-        _pageController.jumpToPage(currentIndexInNextPages);
-        _pageController.animateToPage(
-          nextIndex,
-          duration: const Duration(milliseconds: 220),
-          curve: Curves.easeOutCubic,
-        );
-      }
-      _prepaginateAroundCurrentPage();
+      _schedulePrepaginationAroundCurrentPage();
     });
+    _ReaderPerformanceLog.log(
+      'adjacent_chapter',
+      fields: <String, Object?>{
+        'direction': delta,
+        'fromChapter': currentEntry.chapter.chapterIndex,
+        'targetChapter': targetChapterIndex,
+        'fromPageIndex': currentIndexInNextPages,
+        'targetPageIndex': nextIndex,
+        'windowPages': nextPages.length,
+        'durationMs': chapterSwitchStopwatch.elapsedMilliseconds,
+        'mode': 'transition',
+      },
+    );
     return true;
   }
 
@@ -612,7 +704,23 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
   }
 
   void _openToc() {
-    Scaffold.maybeOf(context)?.openEndDrawer();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _chromeVisible = false;
+      _bottomPanelTab = _ReaderBottomPanelTab.menu;
+      _tocVisible = true;
+    });
+  }
+
+  void _closeToc() {
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      _tocVisible = false;
+    });
   }
 
   void _updateSettings(_ReaderUiSettings settings) {
@@ -623,19 +731,20 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     _rebuildPagesForSettings(_ReaderUiSettings.defaults());
   }
 
-  void _setThemeMode(_ReaderThemeMode mode) {
-    final _ReaderUiSettings nextSettings = switch (mode) {
-      _ReaderThemeMode.day => _settings.copyWith(
-        themeMode: mode,
-        backgroundId: _ReaderBackgroundStyle.paper.id,
-      ),
-      _ReaderThemeMode.night => _settings.copyWith(
-        themeMode: mode,
-        backgroundId: _ReaderBackgroundStyle.midnight.id,
-      ),
-      _ReaderThemeMode.system => _settings.copyWith(themeMode: mode),
-    };
-    _rebuildPagesForSettings(nextSettings);
+  Future<void> _persistSettingsOnDispose() async {
+    try {
+      await _readerRepository.saveReaderSettings(_settings.toModel());
+    } catch (_) {
+      // Ignore teardown races in test/unmount paths.
+    }
+  }
+
+  Future<void> _saveProgressSafely() async {
+    try {
+      await _saveProgress();
+    } catch (_) {
+      // Ignore teardown races in test/unmount paths.
+    }
   }
 
   void _rebuildPagesForSettings(_ReaderUiSettings nextSettings) {
@@ -643,11 +752,13 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
         ? null
         : _pages[_globalPageIndex.clamp(0, _pages.length - 1)];
     setState(() {
+      _invalidatePrepaginationQueue();
       _settings = nextSettings;
       _paginationSignature = null;
       _paginationAnchor = currentEntry;
+      _preserveChromeOnNextPageChange = true;
       if (currentEntry != null) {
-        _globalPageIndex = 0;
+        _setGlobalPageIndex(0);
       }
     });
     _scheduleSettingsSave(nextSettings);
@@ -668,13 +779,13 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
       viewportSize: viewportSize,
       textScaler: textScaler,
     );
-    final String signature = _paginationKey(
-      viewportSize,
-      _settings,
-      textScaler,
-      detail.book.id,
-      detail.chapters.length,
-      _totalReadableLength(detail),
+    final String signature = _ReaderPaginationEngine.paginationKey(
+      viewportSize: viewportSize,
+      settings: _settings,
+      textScaler: textScaler,
+      bookId: detail.book.id,
+      chapterCount: detail.chapters.length,
+      totalReadableLength: _totalReadableLengthCache,
     );
     final ReaderWarmupResult? preparedLaunch = ref
         .read(readerLaunchWarmupServiceProvider)
@@ -688,20 +799,21 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
           detail,
           preparedLaunch,
         );
+        final int nextIndex = preparedLaunch.initialPageIndex.clamp(
+          0,
+          math.max(0, pages.length - 1),
+        );
         setState(() {
+          if (pages.isNotEmpty) {
+            _replacePageController(initialPage: nextIndex);
+          }
           _pages = pages;
-          _globalPageIndex = preparedLaunch.initialPageIndex.clamp(
-            0,
-            math.max(0, pages.length - 1),
-          );
+          _setGlobalPageIndex(nextIndex);
           _paginationSignature = signature;
           _paginationAnchor = null;
         });
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_pageController.hasClients && pages.isNotEmpty) {
-            _pageController.jumpToPage(_globalPageIndex);
-          }
-          _prepaginateAroundCurrentPage();
+          _schedulePrepaginationAroundCurrentPage();
         });
       });
       return;
@@ -743,16 +855,16 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
         return;
       }
       setState(() {
+        if (pages.isNotEmpty) {
+          _replacePageController(initialPage: nextIndex);
+        }
         _pages = pages;
-        _globalPageIndex = nextIndex;
+        _setGlobalPageIndex(nextIndex);
         _paginationSignature = signature;
         _paginationAnchor = null;
       });
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_pageController.hasClients && pages.isNotEmpty) {
-          _pageController.jumpToPage(nextIndex);
-        }
-        _prepaginateAroundCurrentPage();
+        _schedulePrepaginationAroundCurrentPage();
       });
     });
   }
@@ -766,53 +878,126 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     required TextScaler textScaler,
     required BuildContext context,
   }) {
-    final List<int> orderedIndices = _availableWindowChapterIndices(
-      detail,
-      centerChapterIndex,
-      signature,
+    return _ReaderPerformanceLog.track(
+      'compose_window',
+      () {
+        final List<int> orderedIndices =
+            _ReaderPaginationEngine.availableWindowChapterIndices(
+              detail: detail,
+              centerChapterIndex: centerChapterIndex,
+              lookAheadChapters: _readerWindowLookAheadChapters,
+            );
+        final List<_ReaderPageEntry> pages = <_ReaderPageEntry>[];
+        for (final int chapterIndex in orderedIndices) {
+          final ReaderChapterModel? chapter = _chapterByIndex(chapterIndex);
+          if (chapter == null) {
+            continue;
+          }
+          pages.addAll(
+            _chapterPagesFor(
+              chapter: chapter,
+              signature: signature,
+              settings: settings,
+              viewportSize: viewportSize,
+              textScaler: textScaler,
+              context: context,
+            ),
+          );
+        }
+        return pages;
+      },
+      fields: <String, Object?>{
+        'bookId': detail.book.id,
+        'centerChapter': centerChapterIndex,
+        'chapters': detail.chapters.length,
+      },
     );
-    final List<_ReaderPageEntry> pages = <_ReaderPageEntry>[];
-    for (final int chapterIndex in orderedIndices) {
-      final ReaderChapterModel? chapter = _chapterByIndex(chapterIndex);
-      if (chapter == null) {
-        continue;
-      }
-      pages.addAll(
-        _chapterPagesFor(
+  }
+
+  List<_ReaderPageEntry> _composeFocusedChapterWindow({
+    required ReaderBookDetail detail,
+    required int chapterIndex,
+    required String signature,
+    required _ReaderUiSettings settings,
+    required Size viewportSize,
+    required TextScaler textScaler,
+    required BuildContext context,
+  }) {
+    return _ReaderPerformanceLog.track(
+      'compose_focused_window',
+      () {
+        final ReaderChapterModel? chapter = _chapterByIndex(chapterIndex);
+        if (chapter == null) {
+          return const <_ReaderPageEntry>[];
+        }
+        return _chapterPagesFor(
           chapter: chapter,
           signature: signature,
           settings: settings,
           viewportSize: viewportSize,
           textScaler: textScaler,
           context: context,
-        ),
-      );
-    }
-    return pages;
+        );
+      },
+      fields: <String, Object?>{
+        'bookId': detail.book.id,
+        'chapterIndex': chapterIndex,
+        'chapters': detail.chapters.length,
+      },
+    );
   }
 
-  List<int> _availableWindowChapterIndices(
-    ReaderBookDetail detail,
-    int centerChapterIndex,
-    String signature,
-  ) {
-    final List<int> orderedIndices = <int>[];
-    final int previousChapter = centerChapterIndex - 1;
-    if (previousChapter >= 0 &&
-        _chapterPaginationCache.containsKey(
-          _chapterPaginationKey(signature, previousChapter),
-        )) {
-      orderedIndices.add(previousChapter);
-    }
-    orderedIndices.add(centerChapterIndex);
-    final int nextChapter = centerChapterIndex + 1;
-    if (nextChapter < detail.chapters.length &&
-        _chapterPaginationCache.containsKey(
-          _chapterPaginationKey(signature, nextChapter),
-        )) {
-      orderedIndices.add(nextChapter);
-    }
-    return orderedIndices;
+  List<_ReaderPageEntry> _composeChapterTransitionWindow({
+    required ReaderBookDetail detail,
+    required int fromChapterIndex,
+    required int targetChapterIndex,
+    required String signature,
+    required _ReaderUiSettings settings,
+    required Size viewportSize,
+    required TextScaler textScaler,
+    required BuildContext context,
+  }) {
+    return _ReaderPerformanceLog.track(
+      'compose_transition_window',
+      () {
+        final int firstChapterIndex = math.min(
+          fromChapterIndex,
+          targetChapterIndex,
+        );
+        final int lastChapterIndex = math.max(
+          fromChapterIndex,
+          targetChapterIndex,
+        );
+        final List<_ReaderPageEntry> pages = <_ReaderPageEntry>[];
+        for (
+          int chapterIndex = firstChapterIndex;
+          chapterIndex <= lastChapterIndex;
+          chapterIndex += 1
+        ) {
+          final ReaderChapterModel? chapter = _chapterByIndex(chapterIndex);
+          if (chapter == null) {
+            continue;
+          }
+          pages.addAll(
+            _chapterPagesFor(
+              chapter: chapter,
+              signature: signature,
+              settings: settings,
+              viewportSize: viewportSize,
+              textScaler: textScaler,
+              context: context,
+            ),
+          );
+        }
+        return pages;
+      },
+      fields: <String, Object?>{
+        'bookId': detail.book.id,
+        'fromChapter': fromChapterIndex,
+        'targetChapter': targetChapterIndex,
+        'chapters': detail.chapters.length,
+      },
+    );
   }
 
   List<_ReaderPageEntry> _chapterPagesFor({
@@ -823,100 +1008,173 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
     required TextScaler textScaler,
     required BuildContext context,
   }) {
-    final String cacheKey = _chapterPaginationKey(
+    final String cacheKey = _ReaderPaginationEngine.chapterPaginationKey(
       signature,
       chapter.chapterIndex,
     );
     final List<_ReaderPageEntry>? cachedPages =
-        _chapterPaginationCache[cacheKey];
+        _ReaderPaginationEngine.cachedChapterPages(cacheKey);
     if (cachedPages != null) {
-      _touchChapterPagination(cacheKey, cachedPages);
+      _ReaderPerformanceLog.log(
+        'chapter_pages_cache_hit',
+        fields: <String, Object?>{
+          'chapterIndex': chapter.chapterIndex,
+          'pages': cachedPages.length,
+        },
+      );
       return cachedPages;
     }
-    final List<_ReaderPageEntry> pages = _buildChapterPages(
-      chapter,
-      settings,
-      viewportSize,
-      textScaler,
-      context,
+    final int readableTextLength = _readableText(chapter).trim().length;
+    final List<_ReaderPageEntry>? diskCachedPages =
+        _ReaderPaginationDiskCache.load(
+          cacheKey: cacheKey,
+          chapter: chapter,
+          textLength: readableTextLength,
+        );
+    if (diskCachedPages != null) {
+      _ReaderPaginationEngine.touchChapterPagination(cacheKey, diskCachedPages);
+      _ReaderPerformanceLog.log(
+        'chapter_pages_disk_cache_hit',
+        fields: <String, Object?>{
+          'chapterIndex': chapter.chapterIndex,
+          'pages': diskCachedPages.length,
+        },
+      );
+      return diskCachedPages;
+    }
+    final List<_ReaderPageEntry> pages = _ReaderPerformanceLog.track(
+      'paginate_chapter',
+      () {
+        return _buildChapterPages(
+          chapter,
+          settings,
+          viewportSize,
+          textScaler,
+          context,
+        );
+      },
+      fields: <String, Object?>{
+        'chapterIndex': chapter.chapterIndex,
+        'textLength': readableTextLength,
+        'viewport':
+            '${viewportSize.width.round()}x${viewportSize.height.round()}',
+        'fontSize': settings.fontSize,
+        'lineHeight': settings.lineHeight,
+        'font': settings.fontId,
+      },
     );
-    _touchChapterPagination(cacheKey, pages);
+    _ReaderPerformanceLog.log(
+      'paginate_chapter_result',
+      fields: <String, Object?>{
+        'chapterIndex': chapter.chapterIndex,
+        'pages': pages.length,
+      },
+    );
+    _ReaderPaginationEngine.touchChapterPagination(cacheKey, pages);
+    _ReaderPaginationDiskCache.store(
+      cacheKey: cacheKey,
+      chapter: chapter,
+      textLength: readableTextLength,
+      pages: pages,
+    );
     return pages;
   }
 
   void _prepaginateAroundCurrentPage() {
     final ReaderBookDetail? detail = _detail;
-    if (detail == null || _pages.isEmpty || _paginationSignature == null) {
+    final String? signature = _paginationSignature;
+    final _ReaderLayoutSnapshot? snapshot = _layoutSnapshot;
+    if (detail == null ||
+        _pages.isEmpty ||
+        signature == null ||
+        snapshot == null) {
       return;
     }
     final _ReaderPageEntry entry =
         _pages[_globalPageIndex.clamp(0, math.max(0, _pages.length - 1))];
     final int chapterIndex = entry.chapter.chapterIndex;
+    final int scheduledRevision = _prepaginationRevision;
     final List<int> targets = <int>[
       if (chapterIndex > 0) chapterIndex - 1,
       if (chapterIndex < detail.chapters.length - 1) chapterIndex + 1,
+      if (chapterIndex < detail.chapters.length - 2) chapterIndex + 2,
     ];
     for (final int target in targets) {
-      final String cacheKey = _chapterPaginationKey(
-        _paginationSignature!,
+      final String cacheKey = _ReaderPaginationEngine.chapterPaginationKey(
+        signature,
         target,
       );
-      if (_chapterPaginationCache.containsKey(cacheKey) ||
+      if (_ReaderPaginationEngine.hasCachedChapterPages(cacheKey) ||
           _queuedPrepaginationKeys.contains(cacheKey)) {
         continue;
       }
       _queuedPrepaginationKeys.add(cacheKey);
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted || _paginationSignature == null) {
-          _queuedPrepaginationKeys.remove(cacheKey);
-          return;
-        }
-        final ReaderChapterModel? chapter = _chapterByIndex(target);
-        final _ReaderLayoutSnapshot? snapshot = _layoutSnapshot;
-        if (chapter == null || snapshot == null) {
-          _queuedPrepaginationKeys.remove(cacheKey);
-          return;
-        }
-        _chapterPagesFor(
-          chapter: chapter,
-          signature: _paginationSignature!,
-          settings: _settings,
-          viewportSize: snapshot.viewportSize,
-          textScaler: snapshot.textScaler,
-          context: context,
-        );
-        _queuedPrepaginationKeys.remove(cacheKey);
-      });
+      unawaited(
+        SchedulerBinding.instance.scheduleTask<void>(
+          () {
+            if (!mounted ||
+                _paginationSignature != signature ||
+                _prepaginationRevision != scheduledRevision) {
+              _queuedPrepaginationKeys.remove(cacheKey);
+              return;
+            }
+            final ReaderChapterModel? chapter = _chapterByIndex(target);
+            if (chapter == null) {
+              _queuedPrepaginationKeys.remove(cacheKey);
+              return;
+            }
+            _ReaderPerformanceLog.track(
+              'prepaginate_chapter',
+              () {
+                _chapterPagesFor(
+                  chapter: chapter,
+                  signature: signature,
+                  settings: _settings,
+                  viewportSize: snapshot.viewportSize,
+                  textScaler: snapshot.textScaler,
+                  context: context,
+                );
+              },
+              fields: <String, Object?>{
+                'fromChapter': chapterIndex,
+                'targetChapter': target,
+              },
+            );
+            _queuedPrepaginationKeys.remove(cacheKey);
+          },
+          Priority.idle,
+          debugLabel: 'reader prepaginate chapter $target',
+        ),
+      );
     }
   }
 
-  void _ensurePaginationFromLastLayout() {
-    setState(() {
-      _pages = const <_ReaderPageEntry>[];
-      _globalPageIndex = 0;
+  void _schedulePrepaginationAroundCurrentPage() {
+    _prepaginationDebounce?.cancel();
+    _prepaginationDebounce = Timer(const Duration(milliseconds: 420), () {
+      if (!mounted) {
+        return;
+      }
+      if (_pageController.hasClients &&
+          _pageController.position.isScrollingNotifier.value) {
+        _schedulePrepaginationAroundCurrentPage();
+        return;
+      }
+      _prepaginateAroundCurrentPage();
     });
   }
 
-  String _paginationKey(
-    Size viewportSize,
-    _ReaderUiSettings settings,
-    TextScaler textScaler,
-    String bookId,
-    int chapterCount,
-    int totalReadableLength,
-  ) {
-    return <Object>[
-      bookId,
-      chapterCount,
-      totalReadableLength,
-      viewportSize.width.round(),
-      viewportSize.height.round(),
-      textScaler.scale(100).round(),
-      settings.fontSize,
-      settings.lineHeight,
-      settings.pageMarginId,
-      settings.fontId,
-    ].join('|');
+  void _invalidatePrepaginationQueue() {
+    _prepaginationRevision += 1;
+    _queuedPrepaginationKeys.clear();
+  }
+
+  void _ensurePaginationFromLastLayout() {
+    _invalidatePrepaginationQueue();
+    setState(() {
+      _pages = const <_ReaderPageEntry>[];
+      _setGlobalPageIndex(0);
+    });
   }
 
   List<_ReaderPageEntry> _pageEntriesFromWarmup(
@@ -943,18 +1201,6 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
           );
         })
         .toList(growable: false);
-  }
-
-  String _chapterPaginationKey(String signature, int chapterIndex) {
-    return '$signature#$chapterIndex';
-  }
-
-  void _touchChapterPagination(String cacheKey, List<_ReaderPageEntry> pages) {
-    _chapterPaginationCache.remove(cacheKey);
-    _chapterPaginationCache[cacheKey] = pages;
-    while (_chapterPaginationCache.length > _maxChapterPaginationCacheEntries) {
-      _chapterPaginationCache.remove(_chapterPaginationCache.keys.first);
-    }
   }
 
   _ReaderPageLayout _pageLayoutFor(
@@ -1110,64 +1356,78 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
       },
       child: Scaffold(
         backgroundColor: backgroundStyle.color,
-        endDrawer: _detail == null
-            ? null
-            : _ReaderTocDrawer(
-                chapters: _detail!.chapters,
-                currentChapterIndex: currentEntry?.chapter.chapterIndex ?? 0,
-                onSelectChapter: (int chapterIndex) {
-                  Navigator.of(context).pop();
-                  _goToChapter(chapterIndex);
-                },
-              ),
         body: Stack(
           children: <Widget>[
             Positioned.fill(child: _buildBody()),
-            if (_chromeVisible &&
-                _detail != null &&
-                currentEntry != null) ...<Widget>[
-              _ReaderTopBar(
-                title: currentEntry.chapter.title,
-                textColor: textColor,
-                dividerColor: dividerColor,
-                onBack: () => Navigator.of(context).maybePop(),
-                onToc: _openToc,
+            if (_detail != null && currentEntry != null) ...<Widget>[
+              IgnorePointer(
+                ignoring: !_chromeVisible,
+                child: AnimatedOpacity(
+                  opacity: _chromeVisible ? 1 : 0,
+                  duration: const Duration(milliseconds: 180),
+                  curve: Curves.easeOutCubic,
+                  child: AnimatedSlide(
+                    offset: _chromeVisible
+                        ? Offset.zero
+                        : const Offset(0, -0.08),
+                    duration: const Duration(milliseconds: 220),
+                    curve: Curves.easeOutCubic,
+                    child: _ReaderTopBar(
+                      title: currentEntry.chapter.title,
+                      textColor: textColor,
+                      dividerColor: dividerColor,
+                      onBack: () => Navigator.of(context).maybePop(),
+                      onToc: _openToc,
+                    ),
+                  ),
+                ),
               ),
               Align(
                 alignment: Alignment.bottomCenter,
-                child: _ReaderSettingsPanel(
-                  settings: _settings,
-                  textColor: textColor,
-                  accentColor: _accent,
-                  panelColor: _overlaySurface,
-                  chipColor: _overlayChipSurface,
-                  onRestoreDefaults: _restoreDefaultSettings,
-                  onFontSizeChanged: (double value) {
-                    _updateSettings(_settings.copyWith(fontSize: value));
-                  },
-                  onLineHeightChanged: (double value) {
-                    _updateSettings(_settings.copyWith(lineHeight: value));
-                  },
-                  onPageMarginChanged: (_ReaderPageMargin margin) {
-                    _updateSettings(
-                      _settings.copyWith(pageMarginId: margin.id),
-                    );
-                  },
-                  onFontChanged: (_ReaderFontOption font) {
-                    _updateSettings(_settings.copyWith(fontId: font.id));
-                  },
-                  onBackgroundChanged: (_ReaderBackgroundStyle style) {
-                    _updateSettings(_settings.copyWith(backgroundId: style.id));
-                  },
-                  onThemeModeChanged: _setThemeMode,
+                child: IgnorePointer(
+                  ignoring: !_chromeVisible,
+                  child: AnimatedOpacity(
+                    opacity: _chromeVisible ? 1 : 0,
+                    duration: const Duration(milliseconds: 180),
+                    curve: Curves.easeOutCubic,
+                    child: AnimatedSlide(
+                      offset: _chromeVisible
+                          ? Offset.zero
+                          : const Offset(0, 0.08),
+                      duration: const Duration(milliseconds: 240),
+                      curve: Curves.easeOutCubic,
+                      child: _buildBottomPanel(textColor),
+                    ),
+                  ),
                 ),
               ),
             ],
-            if (_detail != null && currentEntry != null && !_chromeVisible)
-              _ReaderPageProgress(
-                currentPage: currentEntry.pageInChapter + 1,
-                totalPages: currentEntry.pageCountInChapter,
-                color: mutedColor,
+            if (_detail != null && _pages.isNotEmpty && !_chromeVisible)
+              ValueListenableBuilder<int>(
+                valueListenable: _visiblePageIndexNotifier,
+                builder: (BuildContext context, int pageIndex, Widget? child) {
+                  final _ReaderPageEntry entry =
+                      _pages[pageIndex.clamp(0, _pages.length - 1)];
+                  return _ReaderPageProgress(
+                    currentPage: entry.pageInChapter + 1,
+                    totalPages: entry.pageCountInChapter,
+                    color: mutedColor,
+                  );
+                },
+              ),
+            if (_detail != null && currentEntry != null)
+              _ReaderTocOverlay(
+                visible: _tocVisible,
+                onDismiss: _closeToc,
+                child: _ReaderTocDrawer(
+                  chapters: _detail!.chapters,
+                  currentChapterIndex: currentEntry.chapter.chapterIndex,
+                  currentChapterTitle: currentEntry.chapter.title,
+                  onClose: _closeToc,
+                  onSelectChapter: (int chapterIndex) {
+                    _goToChapter(chapterIndex);
+                  },
+                ),
               ),
           ],
         ),
@@ -1177,7 +1437,7 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
 
   Widget _buildBody() {
     if (_loading) {
-      return _ReaderPreparingState(detail: _detail);
+      return const _ReaderPreparingState();
     }
     if (_errorMessage != null) {
       final bool missingBook = _errorMessage == '书籍不存在或已被删除';
@@ -1197,7 +1457,7 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
       return LayoutBuilder(
         builder: (BuildContext context, BoxConstraints constraints) {
           _ensurePagination(context, constraints, _paginationAnchor);
-          return _ReaderPreparingState(detail: _detail);
+          return const _ReaderPreparingState();
         },
       );
     }
@@ -1216,18 +1476,24 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
           behavior: HitTestBehavior.opaque,
           onTapUp: (TapUpDetails details) => _handleTapUp(details, context),
           child: PageView.builder(
-            key: ValueKey<String>(_paginationSignature ?? '${_pages.length}'),
+            key: ValueKey<String>(
+              '${_paginationSignature ?? 'pending'}:$_pageControllerRevision',
+            ),
             controller: _pageController,
             itemCount: _pages.length,
+            allowImplicitScrolling: false,
             onPageChanged: _onPageChanged,
             itemBuilder: (BuildContext context, int index) {
               final _ReaderPageEntry entry = _pages[index];
-              return _ReaderTextPage(
-                chapterTitle: entry.chapter.title,
-                text: entry.content,
-                showTitle: entry.showsTitle,
-                settings: _settings,
-                backgroundStyle: _resolvedBackgroundStyle(context),
+              return RepaintBoundary(
+                key: ValueKey<String>(entry.stableKey),
+                child: _ReaderTextPage(
+                  chapterTitle: entry.chapter.title,
+                  text: entry.content,
+                  showTitle: entry.showsTitle,
+                  settings: _settings,
+                  backgroundStyle: _resolvedBackgroundStyle(context),
+                ),
               );
             },
           ),
@@ -1242,6 +1508,71 @@ class _ReaderPageState extends ConsumerState<ReaderPage>
       return '本章暂无正文内容';
     }
     return text;
+  }
+
+  Widget _buildBottomPanel(Color textColor) {
+    return switch (_bottomPanelTab) {
+      _ReaderBottomPanelTab.menu => _ReaderBottomMenuPanel(
+        textColor: textColor,
+        panelColor: _overlaySurface,
+        chipColor: _overlayChipSurface,
+        onOpenToc: () {
+          _openToc();
+        },
+        onOpenBackground: () {
+          setState(() {
+            _bottomPanelTab = _ReaderBottomPanelTab.background;
+          });
+        },
+        onOpenSettings: () {
+          setState(() {
+            _bottomPanelTab = _ReaderBottomPanelTab.settings;
+          });
+        },
+      ),
+      _ReaderBottomPanelTab.background => _ReaderBackgroundPanel(
+        settings: _settings,
+        textColor: textColor,
+        accentColor: _accent,
+        panelColor: _overlaySurface,
+        onBack: () {
+          setState(() {
+            _bottomPanelTab = _ReaderBottomPanelTab.menu;
+          });
+        },
+        onBackgroundChanged: (_ReaderBackgroundStyle style) {
+          _updateSettings(_settings.copyWith(backgroundId: style.id));
+        },
+      ),
+      _ReaderBottomPanelTab.settings => _ReaderSettingsPanel(
+        settings: _settings,
+        textColor: textColor,
+        accentColor: _accent,
+        panelColor: _overlaySurface,
+        chipColor: _overlayChipSurface,
+        onRestoreDefaults: _restoreDefaultSettings,
+        onBack: () {
+          setState(() {
+            _bottomPanelTab = _ReaderBottomPanelTab.menu;
+          });
+        },
+        onFontSizeChanged: (double value) {
+          _updateSettings(_settings.copyWith(fontSize: value));
+        },
+        onLineHeightChanged: (double value) {
+          _updateSettings(_settings.copyWith(lineHeight: value));
+        },
+        onPageMarginChanged: (_ReaderPageMargin margin) {
+          _updateSettings(_settings.copyWith(pageMarginId: margin.id));
+        },
+        onFontChanged: (_ReaderFontOption font) {
+          _updateSettings(_settings.copyWith(fontId: font.id));
+        },
+        onLeftTapActionChanged: (_ReaderLeftTapAction action) {
+          _updateSettings(_settings.copyWith(leftTapAction: action.id));
+        },
+      ),
+    };
   }
 }
 
@@ -1339,15 +1670,7 @@ class _ReaderTextPage extends StatelessWidget {
   }
 
   String _displayText(String value) {
-    final List<String> lines = value
-        .split('\n')
-        .map((String item) => item.trimRight())
-        .where((String item) => item.isNotEmpty)
-        .toList(growable: false);
-    if (lines.isEmpty) {
-      return value;
-    }
-    return lines.join('\n');
+    return _ReaderPaginationEngine.displayText(value);
   }
 
   String _stripLeadingDuplicateTitle(String body, String title) {
@@ -1485,62 +1808,248 @@ class _ReaderPageProgress extends StatelessWidget {
   }
 }
 
-class _ReaderTocDrawer extends StatelessWidget {
-  const _ReaderTocDrawer({
-    required this.chapters,
-    required this.currentChapterIndex,
-    required this.onSelectChapter,
+class _ReaderTocOverlay extends StatelessWidget {
+  const _ReaderTocOverlay({
+    required this.visible,
+    required this.onDismiss,
+    required this.child,
   });
 
-  final List<ReaderChapterModel> chapters;
-  final int currentChapterIndex;
-  final ValueChanged<int> onSelectChapter;
+  final bool visible;
+  final VoidCallback onDismiss;
+  final Widget child;
 
   @override
   Widget build(BuildContext context) {
-    return Drawer(
-      backgroundColor: _ReaderPageState._paper,
-      child: SafeArea(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            const Padding(
-              padding: EdgeInsets.fromLTRB(20, 20, 20, 12),
-              child: Text(
-                '目录',
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.w800,
-                  color: _ReaderPageState._ink,
-                ),
+    return IgnorePointer(
+      ignoring: !visible,
+      child: Stack(
+        children: <Widget>[
+          AnimatedOpacity(
+            opacity: visible ? 1 : 0,
+            duration: const Duration(milliseconds: 160),
+            curve: Curves.easeOutCubic,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: onDismiss,
+              child: const ColoredBox(color: Color(0x33000000)),
+            ),
+          ),
+          Align(
+            alignment: Alignment.bottomCenter,
+            child: AnimatedSlide(
+              offset: visible ? Offset.zero : const Offset(0, 1),
+              duration: const Duration(milliseconds: 220),
+              curve: Curves.easeOutCubic,
+              child: AnimatedOpacity(
+                opacity: visible ? 1 : 0,
+                duration: const Duration(milliseconds: 160),
+                curve: Curves.easeOutCubic,
+                child: child,
               ),
             ),
-            const Divider(height: 1, color: _ReaderPageState._line),
-            Expanded(
-              child: ListView.builder(
-                itemCount: chapters.length,
-                itemBuilder: (BuildContext context, int index) {
-                  final ReaderChapterModel chapter = chapters[index];
-                  final bool selected = index == currentChapterIndex;
-                  return ListTile(
-                    selected: selected,
-                    selectedColor: const Color(0xFF6B573F),
-                    contentPadding: EdgeInsets.only(
-                      left: 20 + (chapter.level - 1).clamp(0, 4) * 14,
-                      right: 16,
-                    ),
-                    title: Text(
-                      chapter.title,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    subtitle: Text('第 ${chapter.chapterIndex + 1} 章'),
-                    onTap: () => onSelectChapter(chapter.chapterIndex),
-                  );
-                },
-              ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ReaderTocDrawer extends StatefulWidget {
+  const _ReaderTocDrawer({
+    required this.chapters,
+    required this.currentChapterIndex,
+    required String currentChapterTitle,
+    required this.onClose,
+    required this.onSelectChapter,
+  }) : _currentChapterTitle = currentChapterTitle;
+
+  final List<ReaderChapterModel> chapters;
+  final int currentChapterIndex;
+  final String? _currentChapterTitle;
+  String get currentChapterTitle => _currentChapterTitle ?? '';
+  final VoidCallback onClose;
+  final ValueChanged<int> onSelectChapter;
+
+  @override
+  State<_ReaderTocDrawer> createState() => _ReaderTocDrawerState();
+}
+
+class _ReaderTocDrawerState extends State<_ReaderTocDrawer> {
+  late final ScrollController _scrollController;
+  double _handleDragOffset = 0;
+  bool _isDraggingHandle = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollController = ScrollController(
+      initialScrollOffset: _estimatedInitialOffset(),
+    );
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  void _handleDragUpdate(DragUpdateDetails details) {
+    final double delta = details.primaryDelta ?? 0;
+    final double maxDragDistance = MediaQuery.of(context).size.height * 0.72;
+    setState(() {
+      _isDraggingHandle = true;
+      _handleDragOffset = (_handleDragOffset + delta).clamp(0, maxDragDistance);
+    });
+  }
+
+  void _handleDragEnd(DragEndDetails details) {
+    final double velocity = details.primaryVelocity ?? 0;
+    final double closeThreshold = MediaQuery.of(context).size.height * 0.18;
+    if (_handleDragOffset > closeThreshold || velocity > 700) {
+      widget.onClose();
+    }
+    setState(() {
+      _isDraggingHandle = false;
+      _handleDragOffset = 0;
+    });
+  }
+
+  double _estimatedInitialOffset() {
+    final int targetPosition = _targetChapterPosition();
+    if (targetPosition <= 0) {
+      return 0;
+    }
+    const double estimatedTileExtent = 72;
+    const double preferredAlignmentOffset = 3;
+    return ((targetPosition - preferredAlignmentOffset) * estimatedTileExtent)
+        .clamp(0, double.infinity);
+  }
+
+  int _targetChapterPosition() {
+    final String currentTitle = widget.currentChapterTitle.trim();
+    if (currentTitle.isNotEmpty) {
+      final int titleMatchIndex = widget.chapters.indexWhere(
+        (ReaderChapterModel chapter) => chapter.title.trim() == currentTitle,
+      );
+      if (titleMatchIndex >= 0) {
+        return titleMatchIndex;
+      }
+    }
+    return widget.chapters.indexWhere(
+      (ReaderChapterModel chapter) =>
+          chapter.chapterIndex == widget.currentChapterIndex,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final double bottomInset = MediaQuery.of(context).padding.bottom;
+    final double dragProgress = MediaQuery.of(context).size.height <= 0
+        ? 0
+        : (_handleDragOffset / (MediaQuery.of(context).size.height * 0.72))
+              .clamp(0, 1);
+    return Material(
+      color: Colors.transparent,
+      child: AnimatedContainer(
+        duration: _isDraggingHandle
+            ? Duration.zero
+            : const Duration(milliseconds: 140),
+        curve: Curves.easeOutCubic,
+        transform: Matrix4.translationValues(0, _handleDragOffset, 0),
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.of(context).size.height * 0.72,
+        ),
+        decoration: BoxDecoration(
+          color: _ReaderPageState._paper,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+          boxShadow: <BoxShadow>[
+            BoxShadow(
+              color: Color.lerp(
+                const Color(0x1F000000),
+                Colors.transparent,
+                dragProgress,
+              )!,
+              blurRadius: 28,
+              offset: const Offset(0, -10),
             ),
           ],
+        ),
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: EdgeInsets.only(bottom: bottomInset),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onVerticalDragUpdate: _handleDragUpdate,
+                  onVerticalDragEnd: _handleDragEnd,
+                  child: Center(
+                    child: Container(
+                      width: 54,
+                      height: 6,
+                      margin: const EdgeInsets.only(top: 10, bottom: 8),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFD9D9D9),
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+                  child: const Text(
+                    '目录',
+                    style: TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w800,
+                      color: _ReaderPageState._ink,
+                    ),
+                  ),
+                ),
+                const Divider(height: 1, color: _ReaderPageState._line),
+                Expanded(
+                  child: Scrollbar(
+                    controller: _scrollController,
+                    thumbVisibility: true,
+                    interactive: true,
+                    thickness: 10,
+                    radius: const Radius.circular(999),
+                    child: ListView.builder(
+                      controller: _scrollController,
+                      itemCount: widget.chapters.length,
+                      itemBuilder: (BuildContext context, int index) {
+                        final ReaderChapterModel chapter =
+                            widget.chapters[index];
+                        final bool selected =
+                            chapter.title.trim() ==
+                                widget.currentChapterTitle.trim() ||
+                            chapter.chapterIndex == widget.currentChapterIndex;
+                        return ListTile(
+                          selected: selected,
+                          selectedColor: const Color(0xFF6B573F),
+                          contentPadding: EdgeInsets.only(
+                            left: 20 + (chapter.level - 1).clamp(0, 4) * 14,
+                            right: 16,
+                          ),
+                          title: Text(
+                            chapter.title,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          subtitle: Text('第 ${chapter.chapterIndex + 1} 章'),
+                          onTap: () =>
+                              widget.onSelectChapter(chapter.chapterIndex),
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -1555,12 +2064,12 @@ class _ReaderSettingsPanel extends StatelessWidget {
     required this.panelColor,
     required this.chipColor,
     required this.onRestoreDefaults,
+    required this.onBack,
     required this.onFontSizeChanged,
     required this.onLineHeightChanged,
     required this.onPageMarginChanged,
     required this.onFontChanged,
-    required this.onBackgroundChanged,
-    required this.onThemeModeChanged,
+    required this.onLeftTapActionChanged,
   });
 
   final _ReaderUiSettings settings;
@@ -1569,12 +2078,12 @@ class _ReaderSettingsPanel extends StatelessWidget {
   final Color panelColor;
   final Color chipColor;
   final VoidCallback onRestoreDefaults;
+  final VoidCallback onBack;
   final ValueChanged<double> onFontSizeChanged;
   final ValueChanged<double> onLineHeightChanged;
   final ValueChanged<_ReaderPageMargin> onPageMarginChanged;
   final ValueChanged<_ReaderFontOption> onFontChanged;
-  final ValueChanged<_ReaderBackgroundStyle> onBackgroundChanged;
-  final ValueChanged<_ReaderThemeMode> onThemeModeChanged;
+  final ValueChanged<_ReaderLeftTapAction> onLeftTapActionChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -1614,38 +2123,37 @@ class _ReaderSettingsPanel extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 16),
-              Row(
-                children: <Widget>[
-                  const Spacer(),
-                  Text(
-                    '阅读设置',
-                    style: TextStyle(
-                      fontSize: 19,
-                      fontWeight: FontWeight.w700,
-                      color: textColor,
+              _ReaderPanelHeader(
+                title: '阅读设置',
+                textColor: textColor,
+                leading: _ReaderPanelBackButton(
+                  textColor: textColor,
+                  onTap: onBack,
+                ),
+                trailing: InkWell(
+                  onTap: onRestoreDefaults,
+                  borderRadius: BorderRadius.circular(999),
+                  child: Container(
+                    height: 36,
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: chipColor,
+                      borderRadius: BorderRadius.circular(999),
                     ),
-                  ),
-                  const Spacer(),
-                  InkWell(
-                    onTap: onRestoreDefaults,
-                    borderRadius: BorderRadius.circular(999),
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 4,
-                        vertical: 6,
-                      ),
-                      child: Text(
-                        '恢复默认',
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          color: accentColor,
-                        ),
+                    child: Text(
+                      '恢复默认',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        color: accentColor,
                       ),
                     ),
                   ),
-                ],
+                ),
               ),
+              const SizedBox(height: 18),
+              const Divider(height: 1, color: Color(0xFFEDEAE4)),
               const SizedBox(height: 18),
               _ReaderSettingStepperRow(
                 label: '字号',
@@ -1683,75 +2191,27 @@ class _ReaderSettingsPanel extends StatelessWidget {
               ),
               const SizedBox(height: 18),
               _ReaderSettingGroupRow(
-                label: '字体',
-                textColor: textColor,
-                child: Wrap(
-                  spacing: 10,
-                  runSpacing: 10,
-                  children: _ReaderFontOption.values
-                      .map((_ReaderFontOption font) {
-                        final bool selected = font.id == settings.fontId;
-                        return _ReaderChoiceChip(
-                          label: font.label,
-                          selected: selected,
-                          accentColor: accentColor,
-                          chipColor: chipColor,
-                          onTap: () => onFontChanged(font),
-                        );
-                      })
-                      .toList(growable: false),
-                ),
-              ),
-              const SizedBox(height: 18),
-              _ReaderSettingGroupRow(
-                label: '背景',
-                textColor: textColor,
-                child: SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: Row(
-                    children: _ReaderBackgroundStyle.values
-                        .map((_ReaderBackgroundStyle style) {
-                          final bool selected =
-                              style.id == settings.backgroundId;
-                          return Padding(
-                            padding: EdgeInsets.only(
-                              right: style == _ReaderBackgroundStyle.values.last
-                                  ? 0
-                                  : 10,
-                            ),
-                            child: _ReaderBackgroundChip(
-                              style: style,
-                              selected: selected,
-                              accentColor: accentColor,
-                              onTap: () => onBackgroundChanged(style),
-                            ),
-                          );
-                        })
-                        .toList(growable: false),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 18),
-              _ReaderSettingGroupRow(
-                label: '主题模式',
+                label: '左侧点击',
                 textColor: textColor,
                 child: Row(
-                  children: _ReaderThemeMode.values
-                      .map((_ReaderThemeMode mode) {
-                        final bool selected = mode == settings.themeMode;
+                  children: _ReaderLeftTapAction.values
+                      .map((_ReaderLeftTapAction action) {
+                        final bool selected =
+                            action.id == settings.leftTapAction;
                         return Expanded(
                           child: Padding(
                             padding: EdgeInsets.only(
-                              right: mode == _ReaderThemeMode.values.last
+                              right: action == _ReaderLeftTapAction.values.last
                                   ? 0
                                   : 10,
                             ),
-                            child: _ReaderThemeModeChip(
-                              mode: mode,
+                            child: _ReaderChoiceChip(
+                              label: action.label,
                               selected: selected,
                               accentColor: accentColor,
                               chipColor: chipColor,
-                              onTap: () => onThemeModeChanged(mode),
+                              width: double.infinity,
+                              onTap: () => onLeftTapActionChanged(action),
                             ),
                           ),
                         );
@@ -1759,33 +2219,33 @@ class _ReaderSettingsPanel extends StatelessWidget {
                       .toList(growable: false),
                 ),
               ),
-              const SizedBox(height: 22),
-              const Divider(height: 1, color: Color(0xFFEDEAE4)),
-              const SizedBox(height: 12),
-              InkWell(
-                onTap: () {},
-                borderRadius: BorderRadius.circular(16),
-                child: SizedBox(
-                  height: 52,
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: <Widget>[
-                      Text(
-                        '更多设置',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
-                          color: textColor,
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      Icon(
-                        Icons.chevron_right_rounded,
-                        color: textColor,
-                        size: 22,
-                      ),
-                    ],
+              const SizedBox(height: 18),
+              _ReaderSettingGroupRow(
+                label: '字体',
+                textColor: textColor,
+                child: GridView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: _ReaderFontOption.values.length,
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 3,
+                    crossAxisSpacing: 10,
+                    mainAxisSpacing: 10,
+                    childAspectRatio: 1.75,
                   ),
+                  itemBuilder: (BuildContext context, int index) {
+                    final _ReaderFontOption font =
+                        _ReaderFontOption.values[index];
+                    final bool selected = font.id == settings.fontId;
+                    return _ReaderChoiceChip(
+                      label: font.label,
+                      selected: selected,
+                      accentColor: accentColor,
+                      chipColor: chipColor,
+                      width: double.infinity,
+                      onTap: () => onFontChanged(font),
+                    );
+                  },
                 ),
               ),
             ],
@@ -1802,6 +2262,282 @@ class _ReaderSettingsPanel extends StatelessWidget {
       _ReaderPageMargin.values.length - 1,
     );
     return _ReaderPageMargin.values[nextIndex];
+  }
+}
+
+class _ReaderBottomMenuPanel extends StatelessWidget {
+  const _ReaderBottomMenuPanel({
+    required this.textColor,
+    required this.panelColor,
+    required this.chipColor,
+    required this.onOpenToc,
+    required this.onOpenBackground,
+    required this.onOpenSettings,
+  });
+
+  final Color textColor;
+  final Color panelColor;
+  final Color chipColor;
+  final VoidCallback onOpenToc;
+  final VoidCallback onOpenBackground;
+  final VoidCallback onOpenSettings;
+
+  @override
+  Widget build(BuildContext context) {
+    final double bottomInset = MediaQuery.of(context).padding.bottom;
+    return Container(
+      decoration: BoxDecoration(
+        color: panelColor,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+        boxShadow: const <BoxShadow>[
+          BoxShadow(
+            color: Color(0x14000000),
+            blurRadius: 28,
+            offset: Offset(0, -10),
+          ),
+        ],
+      ),
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(18, 12, 18, 18 + bottomInset),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Container(
+              width: 54,
+              height: 6,
+              decoration: BoxDecoration(
+                color: const Color(0xFFD9D9D9),
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+            const SizedBox(height: 18),
+            Row(
+              children: <Widget>[
+                Expanded(
+                  child: _ReaderMenuAction(
+                    icon: Icons.list_alt_rounded,
+                    label: '目录',
+                    textColor: textColor,
+                    chipColor: chipColor,
+                    onTap: onOpenToc,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _ReaderMenuAction(
+                    icon: Icons.palette_outlined,
+                    label: '背景',
+                    textColor: textColor,
+                    chipColor: chipColor,
+                    onTap: onOpenBackground,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _ReaderMenuAction(
+                    icon: Icons.tune_rounded,
+                    label: '阅读设置',
+                    textColor: textColor,
+                    chipColor: chipColor,
+                    onTap: onOpenSettings,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ReaderBackgroundPanel extends StatelessWidget {
+  const _ReaderBackgroundPanel({
+    required this.settings,
+    required this.textColor,
+    required this.accentColor,
+    required this.panelColor,
+    required this.onBack,
+    required this.onBackgroundChanged,
+  });
+
+  final _ReaderUiSettings settings;
+  final Color textColor;
+  final Color accentColor;
+  final Color panelColor;
+  final VoidCallback onBack;
+  final ValueChanged<_ReaderBackgroundStyle> onBackgroundChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final double bottomInset = MediaQuery.of(context).padding.bottom;
+    return Container(
+      decoration: BoxDecoration(
+        color: panelColor,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+        boxShadow: const <BoxShadow>[
+          BoxShadow(
+            color: Color(0x14000000),
+            blurRadius: 28,
+            offset: Offset(0, -10),
+          ),
+        ],
+      ),
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(18, 10, 18, 18 + bottomInset),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Container(
+              width: 54,
+              height: 6,
+              decoration: BoxDecoration(
+                color: const Color(0xFFD9D9D9),
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+            const SizedBox(height: 16),
+            _ReaderPanelHeader(
+              title: '背景',
+              textColor: textColor,
+              leading: _ReaderPanelBackButton(
+                textColor: textColor,
+                onTap: onBack,
+              ),
+              trailing: const SizedBox(width: 40, height: 40),
+            ),
+            const SizedBox(height: 18),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: _ReaderBackgroundStyle.values
+                    .map((_ReaderBackgroundStyle style) {
+                      final bool selected = style.id == settings.backgroundId;
+                      return Padding(
+                        padding: EdgeInsets.only(
+                          right: style == _ReaderBackgroundStyle.values.last
+                              ? 0
+                              : 10,
+                        ),
+                        child: _ReaderBackgroundChip(
+                          style: style,
+                          selected: selected,
+                          accentColor: accentColor,
+                          onTap: () => onBackgroundChanged(style),
+                        ),
+                      );
+                    })
+                    .toList(growable: false),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ReaderPanelHeader extends StatelessWidget {
+  const _ReaderPanelHeader({
+    required this.title,
+    required this.textColor,
+    required this.leading,
+    required this.trailing,
+  });
+
+  final String title;
+  final Color textColor;
+  final Widget leading;
+  final Widget trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 40,
+      child: Stack(
+        alignment: Alignment.center,
+        children: <Widget>[
+          Align(alignment: Alignment.centerLeft, child: leading),
+          Text(
+            title,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 19,
+              fontWeight: FontWeight.w700,
+              color: textColor,
+              letterSpacing: 0.2,
+            ),
+          ),
+          Align(alignment: Alignment.centerRight, child: trailing),
+        ],
+      ),
+    );
+  }
+}
+
+class _ReaderPanelBackButton extends StatelessWidget {
+  const _ReaderPanelBackButton({required this.textColor, required this.onTap});
+
+  final Color textColor;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(999),
+      child: SizedBox(
+        width: 40,
+        height: 40,
+        child: Icon(Icons.chevron_left_rounded, color: textColor, size: 28),
+      ),
+    );
+  }
+}
+
+class _ReaderMenuAction extends StatelessWidget {
+  const _ReaderMenuAction({
+    required this.icon,
+    required this.label,
+    required this.textColor,
+    required this.chipColor,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color textColor;
+  final Color chipColor;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(18),
+      child: Container(
+        height: 84,
+        decoration: BoxDecoration(
+          color: chipColor,
+          borderRadius: BorderRadius.circular(18),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            Icon(icon, color: textColor, size: 24),
+            const SizedBox(height: 10),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w700,
+                color: textColor,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
 
@@ -1937,6 +2673,7 @@ class _ReaderChoiceChip extends StatelessWidget {
     required this.accentColor,
     required this.chipColor,
     required this.onTap,
+    this.width = 104,
   });
 
   final String label;
@@ -1944,11 +2681,12 @@ class _ReaderChoiceChip extends StatelessWidget {
   final Color accentColor;
   final Color chipColor;
   final VoidCallback onTap;
+  final double width;
 
   @override
   Widget build(BuildContext context) {
     return _ReaderChoiceSurface(
-      width: 104,
+      width: width,
       height: 48,
       onTap: onTap,
       selected: selected,
@@ -1961,49 +2699,6 @@ class _ReaderChoiceChip extends StatelessWidget {
           fontWeight: FontWeight.w600,
           color: selected ? accentColor : const Color(0xFF222222),
         ),
-      ),
-    );
-  }
-}
-
-class _ReaderThemeModeChip extends StatelessWidget {
-  const _ReaderThemeModeChip({
-    required this.mode,
-    required this.selected,
-    required this.accentColor,
-    required this.chipColor,
-    required this.onTap,
-  });
-
-  final _ReaderThemeMode mode;
-  final bool selected;
-  final Color accentColor;
-  final Color chipColor;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return _ReaderChoiceSurface(
-      width: double.infinity,
-      height: 52,
-      onTap: onTap,
-      selected: selected,
-      accentColor: accentColor,
-      chipColor: chipColor,
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: <Widget>[
-          Icon(mode.icon, size: 22, color: selected ? accentColor : null),
-          const SizedBox(width: 8),
-          Text(
-            mode.label,
-            style: TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.w600,
-              color: selected ? accentColor : const Color(0xFF222222),
-            ),
-          ),
-        ],
       ),
     );
   }
@@ -2096,7 +2791,8 @@ class _ReaderUiSettings {
     required this.fontId,
     required this.backgroundId,
     required this.themeMode,
-  });
+    required String leftTapAction,
+  }) : _leftTapAction = leftTapAction;
 
   factory _ReaderUiSettings.defaults() {
     return const _ReaderUiSettings(
@@ -2106,6 +2802,7 @@ class _ReaderUiSettings {
       fontId: 'system',
       backgroundId: 'paper',
       themeMode: _ReaderThemeMode.day,
+      leftTapAction: 'previous_page',
     );
   }
 
@@ -2142,6 +2839,12 @@ class _ReaderUiSettings {
         (_ReaderThemeMode mode) => mode.name == model.themeMode,
         orElse: () => _ReaderThemeMode.day,
       ),
+      leftTapAction:
+          _ReaderLeftTapAction.values.any(
+            (_ReaderLeftTapAction item) => item.id == model.leftTapAction,
+          )
+          ? model.leftTapAction
+          : 'previous_page',
     );
   }
 
@@ -2151,6 +2854,8 @@ class _ReaderUiSettings {
   final String fontId;
   final String backgroundId;
   final _ReaderThemeMode themeMode;
+  final String? _leftTapAction;
+  String get leftTapAction => _leftTapAction ?? 'previous_page';
 
   double get renderFontSize => fontSize + 12;
 
@@ -2183,6 +2888,7 @@ class _ReaderUiSettings {
       fontSize: fontSize,
       lineHeight: lineHeight,
       horizontalPadding: margin.horizontalPadding,
+      leftTapAction: leftTapAction,
     );
   }
 
@@ -2193,6 +2899,7 @@ class _ReaderUiSettings {
     String? fontId,
     String? backgroundId,
     _ReaderThemeMode? themeMode,
+    String? leftTapAction,
   }) {
     return _ReaderUiSettings(
       fontSize: fontSize ?? this.fontSize,
@@ -2201,8 +2908,19 @@ class _ReaderUiSettings {
       fontId: fontId ?? this.fontId,
       backgroundId: backgroundId ?? this.backgroundId,
       themeMode: themeMode ?? this.themeMode,
+      leftTapAction: leftTapAction ?? this.leftTapAction,
     );
   }
+}
+
+enum _ReaderLeftTapAction {
+  previousPage('previous_page', '上一页'),
+  nextPage('next_page', '下一页');
+
+  const _ReaderLeftTapAction(this.id, this.label);
+
+  final String id;
+  final String label;
 }
 
 enum _ReaderThemeMode {
@@ -2215,6 +2933,8 @@ enum _ReaderThemeMode {
   final String label;
   final IconData icon;
 }
+
+enum _ReaderBottomPanelTab { menu, background, settings }
 
 enum _ReaderFontOption {
   system('system', '系统默认', null, <String>[
@@ -2333,72 +3053,11 @@ class _ReaderMessageState extends StatelessWidget {
 }
 
 class _ReaderPreparingState extends StatelessWidget {
-  const _ReaderPreparingState({required this.detail});
-
-  final ReaderBookDetail? detail;
+  const _ReaderPreparingState();
 
   @override
   Widget build(BuildContext context) {
-    final String? coverImagePath = detail?.book.coverImagePath;
-    final String? existingCoverImagePath =
-        coverImagePath != null && File(coverImagePath).existsSync()
-        ? coverImagePath
-        : null;
-    return DecoratedBox(
-      decoration: const BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topCenter,
-          end: Alignment.bottomCenter,
-          colors: <Color>[Color(0xFFF7F2E8), Color(0xFFEAE0CF)],
-        ),
-      ),
-      child: Center(
-        child: AnimatedSwitcher(
-          duration: const Duration(milliseconds: 220),
-          child: existingCoverImagePath != null
-              ? Container(
-                  key: ValueKey<String>(existingCoverImagePath),
-                  width: 168,
-                  height: 236,
-                  clipBehavior: Clip.antiAlias,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(16),
-                    boxShadow: const <BoxShadow>[
-                      BoxShadow(
-                        color: Color(0x22000000),
-                        blurRadius: 24,
-                        offset: Offset(0, 12),
-                      ),
-                    ],
-                  ),
-                  child: Image.file(
-                    File(existingCoverImagePath),
-                    fit: BoxFit.cover,
-                  ),
-                )
-              : Container(
-                  key: const ValueKey<String>('reader-placeholder-cover'),
-                  width: 168,
-                  height: 236,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(16),
-                    gradient: const LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: <Color>[Color(0xFFD9C6A5), Color(0xFFB79B70)],
-                    ),
-                    boxShadow: const <BoxShadow>[
-                      BoxShadow(
-                        color: Color(0x22000000),
-                        blurRadius: 24,
-                        offset: Offset(0, 12),
-                      ),
-                    ],
-                  ),
-                ),
-        ),
-      ),
-    );
+    return const ColoredBox(color: _ReaderPageState._paper);
   }
 }
 
@@ -2438,6 +3097,9 @@ class _ReaderPageEntry {
   final int globalReadableOffset;
   final String content;
   final bool showsTitle;
+
+  String get stableKey =>
+      '${chapter.id}:$pageInChapter:$chapterTextStart:$chapterTextEnd';
 
   _ReaderPageEntry copyWith({int? globalReadableOffset}) {
     return _ReaderPageEntry(
